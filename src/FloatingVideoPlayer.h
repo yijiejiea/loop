@@ -90,8 +90,15 @@ private:
     void updateCursor(ResizeEdge edge);
 
 private:
-    // 视频播放器 (D3D11 硬件加速)
-    D3D11Renderer *m_videoWidget;
+    // 视频播放器 (硬件加速)
+#ifdef _WIN32
+    D3D11Renderer* renderer = new D3D11Renderer(this);
+#elif defined(__APPLE__)
+    // MetalRenderer *renderer = new MetalRenderer(this);  // TODO
+    OpenGLRenderer* renderer = new OpenGLRenderer(this);
+#else
+    OpenGLRenderer* renderer = new OpenGLRenderer(this);
+#endif
 
     // 控制栏
     QWidget *m_controlBar;

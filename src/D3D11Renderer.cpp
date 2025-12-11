@@ -5,12 +5,13 @@
 #include <QDateTime>
 #include <d3dcompiler.h>
 #include <d3d10.h>  // ID3D10Multithread
+#include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
-// NV12 → RGB 像素着色器
+// NV12 → RGB 像素着色器（硬件解码用）
 static const char* g_pixelShaderNV12 = R"(
 Texture2D texY : register(t0);
 Texture2D texUV : register(t1);
@@ -34,6 +35,23 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float b = y + 1.8556 * u;
     
     return float4(saturate(r), saturate(g), saturate(b), 1.0);
+}
+)";
+
+// BGRA 直接采样着色器（软件解码用）
+static const char* g_pixelShaderBGRA = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+struct PS_INPUT {
+    float4 pos : SV_POSITION;
+    float2 tex : TEXCOORD0;
+};
+
+float4 main(PS_INPUT input) : SV_TARGET {
+    // BGRA 需要交换 R 和 B
+    float4 color = tex.Sample(samp, input.tex);
+    return float4(color.b, color.g, color.r, color.a);
 }
 )";
 
@@ -64,7 +82,7 @@ struct Vertex {
 };
 
 D3D11Renderer::D3D11Renderer(QWidget *parent)
-    : QWidget(parent)
+    : VideoRendererBase(parent)
 {
     // 设置窗口属性
     setAttribute(Qt::WA_PaintOnScreen);
@@ -239,18 +257,34 @@ bool D3D11Renderer::createShaders()
                                       vsBlob->GetBufferSize(), &m_inputLayout);
     if (FAILED(hr)) return false;
     
-    // 编译像素着色器
+    // 编译 NV12 像素着色器
     hr = D3DCompile(g_pixelShaderNV12, strlen(g_pixelShaderNV12), nullptr, nullptr, nullptr,
                     "main", "ps_5_0", 0, 0, &psBlob, &errorBlob);
     if (FAILED(hr)) {
         if (errorBlob) {
-            qCritical() << "PS compile error:" << (char*)errorBlob->GetBufferPointer();
+            qCritical() << "PS NV12 compile error:" << (char*)errorBlob->GetBufferPointer();
         }
         return false;
     }
     
     hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
                                       nullptr, &m_pixelShader);
+    if (FAILED(hr)) return false;
+    
+    // 编译 BGRA 像素着色器（软件解码用）
+    psBlob.Reset();
+    errorBlob.Reset();
+    hr = D3DCompile(g_pixelShaderBGRA, strlen(g_pixelShaderBGRA), nullptr, nullptr, nullptr,
+                    "main", "ps_5_0", 0, 0, &psBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) {
+            qCritical() << "PS BGRA compile error:" << (char*)errorBlob->GetBufferPointer();
+        }
+        return false;
+    }
+    
+    hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+                                      nullptr, &m_pixelShaderBGRA);
     if (FAILED(hr)) return false;
     
     // 创建顶点缓冲（全屏四边形）
@@ -326,6 +360,7 @@ void D3D11Renderer::cleanupD3D11()
     m_textureSRV_UV.Reset();
     m_vertexBuffer.Reset();
     m_inputLayout.Reset();
+    m_pixelShaderBGRA.Reset();
     m_pixelShader.Reset();
     m_vertexShader.Reset();
     m_renderTarget.Reset();
@@ -380,9 +415,24 @@ bool D3D11Renderer::openFile(const QString &filename)
         m_videoCodecCtx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(m_videoCodecCtx, codecpar);
         
-        // 初始化 D3D11VA 硬件解码
-        if (!initHardwareDecoder(codec)) {
-            qWarning() << "D3D11VA 硬件解码初始化失败，使用软件解码";
+        // 根据解码模式初始化
+        if (m_decodeMode == Software) {
+            qDebug() << "强制使用软件解码";
+        } else {
+            // Auto 或 Hardware 模式，尝试硬件解码
+            if (!initHardwareDecoder(codec)) {
+                if (m_decodeMode == Hardware) {
+                    emit errorOccurred("硬件解码初始化失败，且设置为强制硬件模式");
+                    closeFile();
+                    return false;
+                }
+                qWarning() << "D3D11VA 硬件解码初始化失败，回退到软件解码";
+            }
+        }
+        
+        // 软件解码时创建颜色转换上下文
+        if (!m_hwDeviceCtx) {
+            // 将在解码时根据实际格式创建 SwsContext
         }
         
         if (avcodec_open2(m_videoCodecCtx, codec, nullptr) < 0) {
@@ -502,6 +552,11 @@ void D3D11Renderer::closeFile()
     if (m_swrCtx) {
         swr_free(&m_swrCtx);
         m_swrCtx = nullptr;
+    }
+    
+    if (m_swsCtx) {
+        sws_freeContext(m_swsCtx);
+        m_swsCtx = nullptr;
     }
     
     if (m_videoCodecCtx) {
@@ -685,19 +740,22 @@ void D3D11Renderer::decodeThread()
                 if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
                 if (ret < 0) break;
                 
-                // D3D11VA 解码：frame->data[0] 是 ID3D11Texture2D
-                // frame->data[1] 是 texture array index
+                double pts = 0;
+                AVStream *stream = m_formatCtx->streams[m_videoStreamIndex];
+                if (frame->pts != AV_NOPTS_VALUE) {
+                    pts = frame->pts * av_q2d(stream->time_base);
+                }
+                
+                VideoFrame vf;
+                vf.pts = pts;
+                
+                // ========================================
+                // 硬件解码路径：D3D11VA
+                // ========================================
                 if (m_hwDeviceCtx && frame->format == AV_PIX_FMT_D3D11) {
                     ID3D11Texture2D *texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
                     int textureIndex = reinterpret_cast<intptr_t>(frame->data[1]);
                     
-                    double pts = 0;
-                    AVStream *stream = m_formatCtx->streams[m_videoStreamIndex];
-                    if (frame->pts != AV_NOPTS_VALUE) {
-                        pts = frame->pts * av_q2d(stream->time_base);
-                    }
-                    
-                    VideoFrame vf;
                     // 复制纹理（因为解码器会复用）
                     D3D11_TEXTURE2D_DESC desc;
                     texture->GetDesc(&desc);
@@ -709,7 +767,7 @@ void D3D11Renderer::decodeThread()
                     
                     ComPtr<ID3D11Texture2D> copyTexture;
                     
-                    // 【重要】锁定 D3D11 上下文进行纹理复制
+                    // 锁定 D3D11 上下文进行纹理复制
                     {
                         QMutexLocker d3dLock(&m_d3dMutex);
                         if (SUCCEEDED(m_device->CreateTexture2D(&desc, nullptr, &copyTexture))) {
@@ -723,18 +781,71 @@ void D3D11Renderer::decodeThread()
                     if (copyTexture) {
                         vf.texture = copyTexture;
                         vf.textureIndex = 0;
-                        vf.pts = pts;
+                    }
+                }
+                // ========================================
+                // 软件解码路径：CPU → BGRA → D3D11 Texture
+                // ========================================
+                else {
+                    // 创建/更新 SwsContext（转换为 BGRA，便于上传到 D3D11）
+                    AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
+                    if (!m_swsCtx) {
+                        m_swsCtx = sws_getContext(
+                            m_videoWidth, m_videoHeight, srcFmt,
+                            m_videoWidth, m_videoHeight, AV_PIX_FMT_BGRA,
+                            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+                        );
+                        qDebug() << "软件解码: 创建颜色转换，格式:" << av_get_pix_fmt_name(srcFmt) << "→ BGRA";
+                    }
+                    
+                    if (m_swsCtx) {
+                        // 分配 BGRA 缓冲区
+                        int bgraLinesize = m_videoWidth * 4;
+                        std::vector<uint8_t> bgraBuffer(bgraLinesize * m_videoHeight);
+                        uint8_t *bgraData[1] = {bgraBuffer.data()};
+                        int bgraLinesizes[1] = {bgraLinesize};
                         
-                        // 加入队列
+                        // 转换到 BGRA
+                        sws_scale(m_swsCtx, frame->data, frame->linesize, 0, m_videoHeight,
+                                 bgraData, bgraLinesizes);
+                        
+                        // 创建 D3D11 BGRA 纹理
+                        D3D11_TEXTURE2D_DESC desc = {};
+                        desc.Width = m_videoWidth;
+                        desc.Height = m_videoHeight;
+                        desc.MipLevels = 1;
+                        desc.ArraySize = 1;
+                        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                        desc.SampleDesc.Count = 1;
+                        desc.Usage = D3D11_USAGE_DEFAULT;
+                        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        
+                        D3D11_SUBRESOURCE_DATA initData = {};
+                        initData.pSysMem = bgraBuffer.data();
+                        initData.SysMemPitch = bgraLinesize;
+                        
+                        ComPtr<ID3D11Texture2D> softTexture;
                         {
-                            QMutexLocker locker(&m_frameMutex);
-                            while (m_frameQueue.size() >= MAX_FRAME_QUEUE && m_running) {
-                                m_frameCondition.wait(&m_frameMutex, 10);
-                            }
-                            if (m_running) {
-                                m_frameQueue.enqueue(vf);
-                            }
+                            QMutexLocker d3dLock(&m_d3dMutex);
+                            m_device->CreateTexture2D(&desc, &initData, &softTexture);
                         }
+                        
+                        if (softTexture) {
+                            vf.texture = softTexture;
+                            vf.textureIndex = 0;
+                            vf.isBGRA = true;  // 标记为 BGRA 格式
+                        }
+                    }
+                }
+                
+                // 加入队列
+                if (vf.texture) {
+                    QMutexLocker locker(&m_frameMutex);
+                    while (m_frameQueue.size() >= MAX_FRAME_QUEUE && m_running) {
+                        m_frameCondition.wait(&m_frameMutex, 10);
+                    }
+                    if (m_running) {
+                        m_frameQueue.enqueue(vf);
                     }
                 }
             }
@@ -812,10 +923,62 @@ void D3D11Renderer::onRenderTimer()
     }
     
     if (hasFrame && frame.texture) {
-        renderNV12Frame(frame.texture.Get(), frame.textureIndex);
+        if (frame.isBGRA) {
+            renderBGRAFrame(frame.texture.Get());
+        } else {
+            renderNV12Frame(frame.texture.Get(), frame.textureIndex);
+        }
         m_currentPts = frame.pts;
         emit positionChanged(m_currentPts);
     }
+#endif
+}
+
+void D3D11Renderer::renderBGRAFrame(ID3D11Texture2D *texture)
+{
+#ifdef _WIN32
+    if (!m_device || !m_context || !m_swapChain) return;
+    
+    QMutexLocker d3dLock(&m_d3dMutex);
+    
+    // 创建 SRV（BGRA 只需要一个）
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    
+    ComPtr<ID3D11ShaderResourceView> srv;
+    m_device->CreateShaderResourceView(texture, &srvDesc, &srv);
+    
+    // 设置渲染状态
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(width());
+    viewport.Height = static_cast<float>(height());
+    viewport.MaxDepth = 1.0f;
+    m_context->RSSetViewports(1, &viewport);
+    
+    m_context->OMSetRenderTargets(1, m_renderTarget.GetAddressOf(), nullptr);
+    
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    m_context->ClearRenderTargetView(m_renderTarget.Get(), clearColor);
+    
+    // 使用 BGRA 着色器（简单直接采样）
+    m_context->VSSetShader(m_vertexShader.Get(), nullptr, 0);
+    m_context->PSSetShader(m_pixelShaderBGRA.Get(), nullptr, 0);
+    m_context->IASetInputLayout(m_inputLayout.Get());
+    
+    UINT stride = sizeof(Vertex);
+    UINT offset = 0;
+    m_context->IASetVertexBuffers(0, 1, m_vertexBuffer.GetAddressOf(), &stride, &offset);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    
+    m_context->PSSetShaderResources(0, 1, srv.GetAddressOf());
+    m_context->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
+    
+    m_context->Draw(4, 0);
+    m_swapChain->Present(1, 0);
+#else
+    Q_UNUSED(texture)
 #endif
 }
 

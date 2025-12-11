@@ -188,9 +188,9 @@ void FloatingVideoPlayer::createControlBar()
     controlLayout->addLayout(buttonLayout);
 
     // 控制栏位置
-    m_controlBar->setParent(m_videoWidget);
-    m_controlBar->move(0, m_videoWidget->height() - m_controlBar->height());
-    m_controlBar->resize(m_videoWidget->width(), m_controlBar->height());
+    m_controlBar->setParent(renderer);
+    m_controlBar->move(0, renderer->height() - m_controlBar->height());
+    m_controlBar->resize(renderer->width(), m_controlBar->height());
 
     // 隐藏定时器
     m_hideControlTimer = new QTimer(this);
@@ -293,7 +293,7 @@ void FloatingVideoPlayer::openVideo(const QString &filePath)
 {
     if (filePath.isEmpty()) return;
     
-    m_videoWidget->loadFile(filePath);
+    renderer->loadFile(filePath);
     
     QFileInfo fileInfo(filePath);
     setWindowTitle(QString("Loop - %1").arg(fileInfo.fileName()));
@@ -301,29 +301,29 @@ void FloatingVideoPlayer::openVideo(const QString &filePath)
 
 void FloatingVideoPlayer::play()
 {
-    m_videoWidget->play();
+    renderer->play();
 }
 
 void FloatingVideoPlayer::pause()
 {
-    m_videoWidget->pause();
+    renderer->pause();
 }
 
 void FloatingVideoPlayer::stop()
 {
-    m_videoWidget->stop();
+    renderer->stop();
     m_progressSlider->setValue(0);
     m_timeLabel->setText("00:00 / 00:00");
 }
 
 void FloatingVideoPlayer::togglePlayPause()
 {
-    m_videoWidget->togglePause();
+    renderer->togglePause();
 }
 
 void FloatingVideoPlayer::setVolume(int volume)
 {
-    m_videoWidget->setVolume(volume);
+    renderer->setVolume(volume);
 }
 
 void FloatingVideoPlayer::setOpacityLevel(qreal opacity)
@@ -515,9 +515,9 @@ void FloatingVideoPlayer::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
     
-    if (m_controlBar && m_videoWidget) {
-        m_controlBar->resize(m_videoWidget->width(), m_controlBar->height());
-        m_controlBar->move(0, m_videoWidget->height() - m_controlBar->height());
+    if (m_controlBar && renderer) {
+        m_controlBar->resize(renderer->width(), m_controlBar->height());
+        m_controlBar->move(0, renderer->height() - m_controlBar->height());
     }
 }
 

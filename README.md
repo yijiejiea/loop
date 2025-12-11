@@ -20,6 +20,7 @@
 - 🔆 **透明度调节** - 50% ~ 100% 可调
 - 🖥️ **双击全屏** - 双击切换全屏模式
 - 🔧 **可扩展架构** - 便于后续添加音视频编解码功能
+- 🖥️ **跨平台设计** - Windows (D3D11) / macOS (Metal) / Linux (OpenGL)
 
 ## 🛠️ 构建要求
 
@@ -147,9 +148,19 @@ loop/
 │   ├── main.cpp                # 程序入口
 │   ├── FloatingVideoPlayer.h   # 悬浮窗口
 │   ├── FloatingVideoPlayer.cpp
+│   │
+│   │ # ===== 跨平台渲染架构 =====
+│   ├── VideoRendererBase.h     # 抽象基类（跨平台接口）
+│   ├── VideoRendererFactory.cpp# 平台渲染器工厂
+│   ├── D3D11Renderer.h         # Windows D3D11 渲染器
+│   ├── D3D11Renderer.cpp
+│   ├── OpenGLRenderer.h        # 跨平台 OpenGL 渲染器
+│   ├── OpenGLRenderer.cpp
+│   │
+│   │ # ===== 旧版兼容 =====
 │   ├── FFmpegPlayer.h          # FFmpeg 播放器核心
 │   ├── FFmpegPlayer.cpp
-│   ├── VideoWidget.h           # 视频渲染组件
+│   ├── VideoWidget.h           # QPainter 渲染组件
 │   └── VideoWidget.cpp
 └── third_party/
     └── ffmpeg/                 # FFmpeg SDK (需自行下载)
@@ -160,28 +171,56 @@ loop/
 
 ## 🏗️ 架构说明
 
-项目采用分层架构设计，便于后续扩展：
+项目采用**跨平台分层架构**设计：
+
+### 跨平台渲染架构
 
 ```
-┌─────────────────────────────────┐
-│     FloatingVideoPlayer         │  UI 层：窗口管理、用户交互
-├─────────────────────────────────┤
-│         VideoWidget             │  渲染层：视频帧显示、缩放
-├─────────────────────────────────┤
-│        FFmpegPlayer             │  播放控制层：播放状态、音视频同步
-├─────────────────────────────────┤
-│        DecodeThread             │  解码层：FFmpeg 音视频解码
-└─────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    VideoRendererBase                        │
+│              (抽象基类，定义通用接口)                        │
+├─────────────────────────────────────────────────────────────┤
+│  openFile() / play() / pause() / stop() / seek()            │
+│  setVolume() / setDecodeMode() / setLoop()                  │
+│  signals: positionChanged, endOfFile, errorOccurred...      │
+└─────────────────────────────────────────────────────────────┘
+              ▲                ▲                ▲
+              │                │                │
+     ┌────────┴───┐   ┌───────┴────┐   ┌───────┴────┐
+     │ D3D11      │   │  Metal     │   │  OpenGL    │
+     │ Renderer   │   │  Renderer  │   │  Renderer  │
+     │ (Windows)  │   │  (macOS)   │   │  (Linux)   │
+     │ D3D11VA    │   │VideoToolbox│   │VAAPI/VDPAU │
+     └────────────┘   └────────────┘   └────────────┘
 ```
+
+### 软硬解码选择
+
+```cpp
+// 设置解码模式
+renderer->setDecodeMode(D3D11Renderer::Auto);      // 自动（优先硬件）
+renderer->setDecodeMode(D3D11Renderer::Hardware);  // 强制硬件解码
+renderer->setDecodeMode(D3D11Renderer::Software);  // 强制软件解码
+
+// 查询当前解码状态
+bool hw = renderer->isHardwareDecoding();
+```
+
+| 场景 | 推荐模式 | 原因 |
+|------|----------|------|
+| 日常播放 | Auto | 自动选择最优方案 |
+| 4K/高码率 | Hardware | CPU 解不动 |
+| 需要逐帧处理 | Software | 需访问原始像素 |
+| 硬解出问题 | Software | 兼容性回退 |
 
 ### 核心类说明
 
 | 类名 | 职责 |
 |------|------|
-| `FloatingVideoPlayer` | 主窗口，处理用户交互、窗口拖动、右键菜单 |
-| `VideoWidget` | 视频渲染组件，接收解码后的帧并显示 |
-| `FFmpegPlayer` | 播放器核心，管理播放状态、音视频同步 |
-| `DecodeThread` | 解码线程，使用 FFmpeg 进行音视频解码 |
+| `VideoRendererBase` | 抽象基类，定义跨平台视频渲染接口 |
+| `D3D11Renderer` | Windows 平台渲染器，D3D11VA 硬件加速 |
+| `OpenGLRenderer` | 跨平台渲染器，支持 VAAPI/VideoToolbox |
+| `FloatingVideoPlayer` | 主窗口，处理用户交互 |
 
 ## 🎬 支持的视频格式
 

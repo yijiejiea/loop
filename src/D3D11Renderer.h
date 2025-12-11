@@ -1,7 +1,7 @@
 #ifndef D3D11RENDERER_H
 #define D3D11RENDERER_H
 
-#include <QWidget>
+#include "VideoRendererBase.h"
 #include <QTimer>
 #include <memory>
 #include <atomic>
@@ -19,7 +19,9 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 }
 #endif
 
@@ -39,49 +41,50 @@ struct AudioData {
 };
 
 /**
- * @brief D3D11 硬件加速视频播放器
+ * @brief D3D11 视频播放器 (Windows 平台)
+ * 
+ * 继承自 VideoRendererBase，实现 Windows 平台的视频渲染
  * 
  * 特点：
- * - 使用 D3D11VA 硬件解码
- * - 解码输出直接是 D3D11 Texture
- * - 使用 D3D11 渲染，全程 GPU 操作
- * - 零 CPU 拷贝，最高性能
+ * - 支持 D3D11VA 硬件解码（默认）
+ * - 支持 FFmpeg 软件解码（可选）
+ * - 使用 D3D11 渲染
+ * - 软硬解码可运行时切换
  */
-class D3D11Renderer : public QWidget
+class D3D11Renderer : public VideoRendererBase
 {
     Q_OBJECT
 
 public:
     explicit D3D11Renderer(QWidget *parent = nullptr);
-    ~D3D11Renderer();
+    ~D3D11Renderer() override;
 
-    // 播放控制
+    // ========================================
+    // 实现 VideoRendererBase 接口
+    // ========================================
+    bool openFile(const QString &filename) override;
+    void closeFile() override;
+    void play() override;
+    void pause() override;
+    void stop() override;
+    void togglePause() override;
+    void seek(double seconds) override;
+    void setVolume(int volume) override;
+    
+    QString rendererName() const override { return "D3D11 (Windows)"; }
+    bool isHardwareDecoding() const override { return m_hwDeviceCtx != nullptr; }
+    
+    // 使用基类的 DecodeMode
+    using VideoRendererBase::DecodeMode;
+    using VideoRendererBase::setDecodeMode;
+    using VideoRendererBase::decodeMode;
+    
+    // 兼容旧接口（停止当前播放，打开新文件并自动播放）
     void loadFile(const QString &filename);
-    void play();
-    void pause();
-    void stop();
-    void togglePause();
-    void seek(double seconds);
-    
-    // 属性
-    void setVolume(int volume);
-    int volume() const { return m_volume; }
-    void setLoop(bool loop) { m_loop = loop; }
-    bool isLoop() const { return m_loop; }
-    
-    // 状态
-    bool isPlaying() const { return m_playing && !m_paused; }
-    bool isPaused() const { return m_paused; }
-    double position() const { return m_currentPts; }
-    double duration() const { return m_duration; }
 
 signals:
-    void positionChanged(double seconds);
+    // 额外信号（基类已有基本信号）
     void durationChanged(double seconds);
-    void playbackStateChanged(bool playing);
-    void fileLoaded();
-    void endOfFile();
-    void errorOccurred(const QString &error);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -102,14 +105,13 @@ private:
     void resizeSwapChain();
     
     // FFmpeg 初始化
-    bool openFile(const QString &filename);
-    void closeFile();
     bool initHardwareDecoder(const AVCodec *codec);
     
     // 解码和渲染
     void decodeThread();
     void renderFrame(ID3D11Texture2D *texture, int textureIndex);
     void renderNV12Frame(ID3D11Texture2D *texture, int textureIndex);
+    void renderBGRAFrame(ID3D11Texture2D *texture);
     
     // 音频
     void setupAudio();
@@ -124,7 +126,8 @@ private:
     ComPtr<IDXGISwapChain1> m_swapChain;
     ComPtr<ID3D11RenderTargetView> m_renderTarget;
     ComPtr<ID3D11VertexShader> m_vertexShader;
-    ComPtr<ID3D11PixelShader> m_pixelShader;
+    ComPtr<ID3D11PixelShader> m_pixelShader;      // NV12 → RGB
+    ComPtr<ID3D11PixelShader> m_pixelShaderBGRA;  // BGRA 直接采样
     ComPtr<ID3D11InputLayout> m_inputLayout;
     ComPtr<ID3D11Buffer> m_vertexBuffer;
     ComPtr<ID3D11SamplerState> m_sampler;
@@ -139,6 +142,7 @@ private:
     AVCodecContext *m_audioCodecCtx = nullptr;
     AVBufferRef *m_hwDeviceCtx = nullptr;
     SwrContext *m_swrCtx = nullptr;
+    SwsContext *m_swsCtx = nullptr;  // 软解码时的颜色转换
     
     int m_videoStreamIndex = -1;
     int m_audioStreamIndex = -1;
@@ -156,13 +160,7 @@ private:
     std::unique_ptr<QAudioSink> m_audioSink;
     QIODevice *m_audioDevice = nullptr;
     
-    // 播放状态
-    bool m_playing = false;
-    bool m_paused = false;
-    bool m_loop = true;
-    int m_volume = 50;
-    double m_duration = 0;
-    double m_currentPts = 0;
+    // 播放状态 (基类已有: m_playing, m_paused, m_loop, m_volume, m_duration, m_currentPts)
     double m_audioClock = 0;
     
     // 视频信息
@@ -180,6 +178,7 @@ private:
 #endif
         int textureIndex = 0;
         double pts = 0;
+        bool isBGRA = false;  // true = 软解码(BGRA), false = 硬解码(NV12)
     };
     QQueue<VideoFrame> m_frameQueue;
     QMutex m_frameMutex;
@@ -187,7 +186,7 @@ private:
     QWaitCondition m_frameCondition;
     static constexpr int MAX_FRAME_QUEUE = 3;  // 小队列，减少延迟
     
-    QString m_currentFile;
+    // m_currentFile 在基类中
     bool m_d3dInitialized = false;
 };
 

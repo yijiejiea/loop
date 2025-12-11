@@ -40,20 +40,39 @@ find_package(Qt6 REQUIRED COMPONENTS
     Gui 
     Widgets
     Multimedia
+    OpenGLWidgets
 )
 
-# 源文件
+# ============================================
+# 源文件（跨平台架构）
+# ============================================
 set(SOURCES
     src/main.cpp
     src/FloatingVideoPlayer.cpp
     src/FloatingVideoPlayer.h
+    src/VideoRendererBase.h
+    src/VideoRendererFactory.cpp
+    # 旧版本兼容
     src/FFmpegPlayer.cpp
     src/FFmpegPlayer.h
     src/VideoWidget.cpp
     src/VideoWidget.h
-    src/D3D11Renderer.cpp
-    src/D3D11Renderer.h
 )
+
+# Windows 平台：D3D11 渲染器
+if(WIN32)
+    list(APPEND SOURCES
+        src/D3D11Renderer.cpp
+        src/D3D11Renderer.h
+    )
+endif()
+
+# 所有平台：OpenGL 渲染器（可选）
+# 如需启用，取消下面注释并添加 Qt OpenGL 依赖
+# list(APPEND SOURCES
+#     src/OpenGLRenderer.cpp
+#     src/OpenGLRenderer.h
+# )
 
 # 创建可执行文件 (WIN32 避免控制台窗口)
 if(WIN32)
@@ -68,6 +87,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Gui
     Qt6::Widgets
     Qt6::Multimedia
+    Qt6::OpenGLWidgets
 )
 
 # 包含目录
