@@ -19,6 +19,13 @@ set(CMAKE_AUTOUIC ON)
 # 推荐下载: ffmpeg-master-latest-win64-gpl-shared.zip
 set(FFMPEG_SDK_PATH "${CMAKE_SOURCE_DIR}/third_party/ffmpeg" CACHE PATH "Path to FFmpeg SDK")
 
+# ============================================
+# SDL3 配置（用于精确音频同步）
+# ============================================
+# 下载地址: https://github.com/libsdl-org/SDL/releases
+# 推荐下载: SDL3-devel-2.x.x-VC.zip
+set(SDL3_PATH "${CMAKE_SOURCE_DIR}/third_party/SDL3" CACHE PATH "Path to SDL3 SDK")
+
 # 检查 FFmpeg 是否存在
 if(EXISTS "${FFMPEG_SDK_PATH}/include/libavcodec/avcodec.h")
     message(STATUS "Found FFmpeg at: ${FFMPEG_SDK_PATH}")
@@ -138,6 +145,37 @@ if(FFMPEG_FOUND)
     target_compile_definitions(${PROJECT_NAME} PRIVATE FFMPEG_AVAILABLE=1)
 else()
     target_compile_definitions(${PROJECT_NAME} PRIVATE FFMPEG_AVAILABLE=0)
+endif()
+
+# ============================================
+# SDL3 链接
+# ============================================
+if(EXISTS "${SDL3_PATH}/include/SDL3/SDL.h")
+    message(STATUS "Found SDL3 at: ${SDL3_PATH}")
+    target_include_directories(${PROJECT_NAME} PRIVATE "${SDL3_PATH}/include")
+    
+    if(WIN32)
+        target_link_libraries(${PROJECT_NAME} PRIVATE
+            "${SDL3_PATH}/lib/x64/SDL3.lib"
+        )
+        # 复制 SDL3.dll
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SDL3_PATH}/lib/x64/SDL3.dll"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            COMMENT "Copying SDL3.dll..."
+        )
+    else()
+        find_package(SDL3 REQUIRED)
+        target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3)
+    endif()
+    
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SDL3_AVAILABLE=1)
+else()
+    message(WARNING "SDL3 not found at ${SDL3_PATH}")
+    message(WARNING "Please download SDL3 from: https://github.com/libsdl-org/SDL/releases")
+    message(WARNING "Download: SDL3-devel-x.x.x-VC.zip and extract to: ${SDL3_PATH}")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SDL3_AVAILABLE=0)
 endif()
 
 # Windows 特定设置

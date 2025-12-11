@@ -29,6 +29,13 @@ extern "C" {
 #include <QMutex>
 #include <QWaitCondition>
 #include <QQueue>
+
+// SDL3 音频（精确同步）
+#if SDL3_AVAILABLE
+#include <SDL3/SDL.h>
+#endif
+
+// Qt 音频（备用）
 #include <QAudioSink>
 #include <QIODevice>
 
@@ -157,11 +164,31 @@ private:
     // 音频队列
     QQueue<AudioData> m_audioQueue;
     QMutex m_audioMutex;
+    
+#if SDL3_AVAILABLE
+    // SDL3 音频（精确同步）
+    SDL_AudioStream *m_sdlAudioStream = nullptr;
+#else
+    // Qt 音频（备用）
     std::unique_ptr<QAudioSink> m_audioSink;
     QIODevice *m_audioDevice = nullptr;
+#endif
+    qint64 m_audioWrittenBytes = 0;  // 已写入音频设备的字节数
     
     // 播放状态 (基类已有: m_playing, m_paused, m_loop, m_volume, m_duration, m_currentPts)
-    double m_audioClock = 0;
+    double m_audioClock = 0;           // 音频主时钟（秒）
+    double m_audioStartPts = 0;        // 第一帧音频的 PTS
+    double m_videoStartPts = 0;        // 第一帧视频的 PTS
+    double m_avSyncOffset = 0;         // 音视频 PTS 偏移 (videoStart - audioStart)
+    bool m_audioClockValid = false;    // 音频时钟是否有效
+    bool m_videoClockValid = false;    // 视频时钟是否有效
+    int m_skipRenderCount = 0;         // 连续跳过渲染的次数
+    
+    // 动态 delay 同步
+    double m_frameTimer = 0;           // 下一帧应该渲染的时间点（秒）
+    double m_lastFramePts = 0;         // 上一帧的 PTS
+    double m_lastDelay = 0.033;        // 上一帧的 delay（默认 ~30fps）
+    int m_consecutiveFastRender = 0;   // 连续快速渲染次数（用于检测视频解码跟不上）
     
     // 视频信息
     int m_videoWidth = 0;
@@ -184,7 +211,7 @@ private:
     QMutex m_frameMutex;
     QMutex m_d3dMutex;  // D3D11 上下文访问保护
     QWaitCondition m_frameCondition;
-    static constexpr int MAX_FRAME_QUEUE = 3;  // 小队列，减少延迟
+    static constexpr int MAX_FRAME_QUEUE = 10;  // 增大队列，避免阻塞解码线程
     
     // m_currentFile 在基类中
     bool m_d3dInitialized = false;

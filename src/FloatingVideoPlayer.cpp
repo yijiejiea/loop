@@ -53,22 +53,53 @@ void FloatingVideoPlayer::setupUI()
     mainLayout->setContentsMargins(EDGE_MARGIN, EDGE_MARGIN, EDGE_MARGIN, EDGE_MARGIN);
     mainLayout->setSpacing(0);
 
-    // D3D11 硬件加速视频组件
-    m_videoWidget = new D3D11Renderer(this);
-    m_videoWidget->setMouseTracking(true);
-    mainLayout->addWidget(m_videoWidget);
+    // 硬件加速视频组件
+#ifdef _WIN32
+    renderer = new D3D11Renderer(this);
+#elif defined(__APPLE__)
+    renderer = new OpenGLRenderer(this);
+#else
+    renderer = new OpenGLRenderer(this);
+#endif
+    renderer->setMouseTracking(true);
+    mainLayout->addWidget(renderer);
 
-    // 连接 D3D11 播放器信号
-    connect(m_videoWidget, &D3D11Renderer::positionChanged, 
-            this, &FloatingVideoPlayer::onPositionChanged);
-    connect(m_videoWidget, &D3D11Renderer::durationChanged, 
-            this, &FloatingVideoPlayer::onDurationChanged);
-    connect(m_videoWidget, &D3D11Renderer::playbackStateChanged, 
-            this, &FloatingVideoPlayer::onPlaybackStateChanged);
-    connect(m_videoWidget, &D3D11Renderer::fileLoaded, 
-            this, &FloatingVideoPlayer::onFileLoaded);
-    connect(m_videoWidget, &D3D11Renderer::errorOccurred, 
-            this, &FloatingVideoPlayer::onErrorOccurred);
+#ifdef _WIN32
+    connect(renderer, &D3D11Renderer::positionChanged,
+        this, &FloatingVideoPlayer::onPositionChanged);
+    connect(renderer, &D3D11Renderer::durationChanged,
+        this, &FloatingVideoPlayer::onDurationChanged);
+    connect(renderer, &D3D11Renderer::playbackStateChanged,
+        this, &FloatingVideoPlayer::onPlaybackStateChanged);
+    connect(renderer, &D3D11Renderer::fileLoaded,
+        this, &FloatingVideoPlayer::onFileLoaded);
+    connect(renderer, &D3D11Renderer::errorOccurred,
+        this, &FloatingVideoPlayer::onErrorOccurred);
+#elif defined(__APPLE__)
+    connect(renderer, &MetalRenderer::positionChanged,
+        this, &FloatingVideoPlayer::onPositionChanged);
+    connect(renderer, &MetalRenderer::durationChanged,
+        this, &FloatingVideoPlayer::onDurationChanged);
+    connect(renderer, &MetalRenderer::playbackStateChanged,
+        this, &FloatingVideoPlayer::onPlaybackStateChanged);
+    connect(renderer, &MetalRenderer::fileLoaded,
+        this, &FloatingVideoPlayer::onFileLoaded);
+    connect(renderer, &MetalRenderer::errorOccurred,
+        this, &FloatingVideoPlayer::onErrorOccurred);
+#else
+    connect(renderer, &OpenGLRenderer::positionChanged,
+        this, &FloatingVideoPlayer::onPositionChanged);
+    connect(renderer, &OpenGLRenderer::durationChanged,
+        this, &FloatingVideoPlayer::onDurationChanged);
+    connect(renderer, &OpenGLRenderer::playbackStateChanged,
+        this, &FloatingVideoPlayer::onPlaybackStateChanged);
+    connect(renderer, &OpenGLRenderer::fileLoaded,
+        this, &FloatingVideoPlayer::onFileLoaded);
+    connect(renderer, &OpenGLRenderer::errorOccurred,
+        this, &FloatingVideoPlayer::onErrorOccurred);
+#endif
+
+   
 
     // 创建控制栏
     createControlBar();
@@ -132,7 +163,7 @@ void FloatingVideoPlayer::createControlBar()
         m_isSliderDragging = false;
         if (m_duration > 0) {
             double seekPos = (m_progressSlider->value() / 1000.0) * m_duration;
-            m_videoWidget->seek(seekPos);
+            renderer->seek(seekPos);
         }
     });
     connect(m_progressSlider, &QSlider::sliderMoved, [this](int value) {

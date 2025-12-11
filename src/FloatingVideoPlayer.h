@@ -92,12 +92,12 @@ private:
 private:
     // 视频播放器 (硬件加速)
 #ifdef _WIN32
-    D3D11Renderer* renderer = new D3D11Renderer(this);
+    D3D11Renderer* renderer;
 #elif defined(__APPLE__)
     // MetalRenderer *renderer = new MetalRenderer(this);  // TODO
-    OpenGLRenderer* renderer = new OpenGLRenderer(this);
+    OpenGLRenderer* renderer;
 #else
-    OpenGLRenderer* renderer = new OpenGLRenderer(this);
+    OpenGLRenderer* renderer;
 #endif
 
     // 控制栏

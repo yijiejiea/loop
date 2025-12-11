@@ -617,7 +617,21 @@ void D3D11Renderer::play()
     m_playing = true;
     m_paused = false;
     
-    m_renderTimer->start(16);  // ~60 fps
+    // 重置同步状态
+    m_audioClockValid = false;
+    m_videoClockValid = false;
+    m_audioStartPts = 0;
+    m_videoStartPts = 0;
+    m_avSyncOffset = 0;
+    m_audioClock = 0;
+    m_audioWrittenBytes = 0;
+    m_skipRenderCount = 0;
+    m_frameTimer = 0;
+    m_lastFramePts = 0;
+    m_lastDelay = 0.033;
+    m_consecutiveFastRender = 0;
+    
+    m_renderTimer->start(8);  // ~120 fps 检查（实际帧率由 delay 控制）
     m_audioTimer->start(5);
     
     emit playbackStateChanged(true);
@@ -640,6 +654,17 @@ void D3D11Renderer::stop()
     m_paused = false;
     m_currentPts = 0;
     m_audioClock = 0;
+    m_audioClockValid = false;
+    m_videoClockValid = false;
+    m_audioStartPts = 0;
+    m_videoStartPts = 0;
+    m_avSyncOffset = 0;
+    m_audioWrittenBytes = 0;
+    m_skipRenderCount = 0;
+    m_frameTimer = 0;
+    m_lastFramePts = 0;
+    m_lastDelay = 0.033;
+    m_consecutiveFastRender = 0;
     
     m_renderTimer->stop();
     m_audioTimer->stop();
@@ -678,16 +703,40 @@ void D3D11Renderer::seek(double seconds)
     m_seekTarget = seconds;
     m_seeking = true;
     m_currentPts = seconds;
-    m_audioClock = seconds;
+    
+    // 重置同步状态
+    m_audioClockValid = false;
+    m_videoClockValid = false;
+    m_audioStartPts = 0;
+    m_videoStartPts = 0;
+    m_avSyncOffset = 0;
+    m_audioClock = 0;
+    m_audioWrittenBytes = 0;
+    m_skipRenderCount = 0;
+    m_frameTimer = 0;
+    m_lastFramePts = 0;
+    m_lastDelay = 0.033;
+    m_consecutiveFastRender = 0;
+    
+#if SDL3_AVAILABLE
+    // 清空 SDL 音频队列
+    if (m_sdlAudioStream) {
+        SDL_ClearAudioStream(m_sdlAudioStream);
+    }
+#endif
+    
     emit positionChanged(seconds);
 }
 
 void D3D11Renderer::setVolume(int volume)
 {
     m_volume = qBound(0, volume, 100);
+#if !SDL3_AVAILABLE
     if (m_audioSink) {
         m_audioSink->setVolume(m_volume / 100.0f);
     }
+#endif
+    // SDL3: 音量在 processAudio() 中处理
 }
 
 void D3D11Renderer::decodeThread()
@@ -699,6 +748,29 @@ void D3D11Renderer::decodeThread()
     AVFrame *frame = av_frame_alloc();
     
     while (m_running) {
+        // ========================================
+        // 【关键】解码限速：如果视频超前音频太多，等待
+        // 防止硬件解码太快导致视频 PTS 远超音频时钟
+        // ========================================
+        {
+            QMutexLocker locker(&m_frameMutex);
+            if (!m_frameQueue.isEmpty() && m_audioClockValid) {
+                double newestVideoPts = m_frameQueue.back().pts;
+                double diff = newestVideoPts - m_audioClock;
+                
+                // 如果视频超前音频超过 0.5 秒，等待
+                while (diff > 0.5 && m_running && !m_seeking) {
+                    // 释放锁，等待 20ms
+                    m_frameCondition.wait(&m_frameMutex, 20);
+                    
+                    // 重新计算差距
+                    if (m_frameQueue.isEmpty()) break;
+                    newestVideoPts = m_frameQueue.back().pts;
+                    diff = newestVideoPts - m_audioClock;
+                }
+            }
+        }
+        
         // 处理 seek
         if (m_seeking) {
             int64_t timestamp = static_cast<int64_t>(m_seekTarget * AV_TIME_BASE);
@@ -838,13 +910,21 @@ void D3D11Renderer::decodeThread()
                     }
                 }
                 
-                // 加入队列
+                // 加入队列（有限速保护，不会长期阻塞）
                 if (vf.texture) {
                     QMutexLocker locker(&m_frameMutex);
-                    while (m_frameQueue.size() >= MAX_FRAME_QUEUE && m_running) {
+                    
+                    // 等待队列有空间（最多等 50ms）
+                    int waitCount = 0;
+                    while (m_frameQueue.size() >= MAX_FRAME_QUEUE && m_running && waitCount < 5) {
                         m_frameCondition.wait(&m_frameMutex, 10);
+                        waitCount++;
                     }
-                    if (m_running) {
+                    
+                    // 超时则丢弃当前帧
+                    if (m_frameQueue.size() >= MAX_FRAME_QUEUE) {
+                        // qDebug() << "[解码] 视频队列满，丢弃新帧 pts=" << pts;
+                    } else if (m_running) {
                         m_frameQueue.enqueue(vf);
                     }
                 }
@@ -854,10 +934,17 @@ void D3D11Renderer::decodeThread()
         // 音频解码
         if (packet->stream_index == m_audioStreamIndex && m_audioCodecCtx && m_swrCtx) {
             ret = avcodec_send_packet(m_audioCodecCtx, packet);
+            
+            static int audioPacketCount = 0;
+            audioPacketCount++;
+            
             while (ret >= 0) {
                 ret = avcodec_receive_frame(m_audioCodecCtx, frame);
                 if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                if (ret < 0) break;
+                if (ret < 0) {
+                    qDebug() << "[音频解码] 错误:" << ret;
+                    break;
+                }
                 
                 double pts = 0;
                 AVStream *stream = m_formatCtx->streams[m_audioStreamIndex];
@@ -887,8 +974,10 @@ void D3D11Renderer::decodeThread()
                     if (m_audioQueue.size() < 100) {
                         m_audioQueue.enqueue(ad);
                     }
+                    // 队列满时直接丢弃，不输出日志
                 }
             }
+            
         }
         
         av_packet_unref(packet);
@@ -904,24 +993,140 @@ void D3D11Renderer::onRenderTimer()
 #ifdef _WIN32
     if (!m_d3dInitialized || !m_playing || m_paused) return;
     
+    // 获取当前时间（秒）
+    double currentTime = QDateTime::currentMSecsSinceEpoch() / 1000.0;
+    
+    // 如果还没到显示时间，跳过（实现延迟渲染）
+    if (m_frameTimer > 0 && currentTime < m_frameTimer) {
+        return;
+    }
+    
     VideoFrame frame;
     bool hasFrame = false;
+    double framePts = 0;
     
     {
         QMutexLocker locker(&m_frameMutex);
-        while (!m_frameQueue.isEmpty()) {
-            frame = m_frameQueue.dequeue();
-            m_frameCondition.wakeOne();
+        
+        if (m_frameQueue.isEmpty()) return;
+        
+        framePts = m_frameQueue.head().pts;
+        
+        // 记录视频首帧 PTS
+        if (!m_videoClockValid) {
+            m_videoStartPts = framePts;
+            m_videoClockValid = true;
+            m_frameTimer = currentTime;  // 初始化 frame timer
+            m_lastFramePts = framePts;
+            qDebug() << "[视频] 首帧 PTS:" << m_videoStartPts;
             
-            // 同步：跳过太旧的帧
-            if (frame.pts < m_audioClock - 0.1) {
-                continue;
+            if (m_audioClockValid) {
+                m_avSyncOffset = m_videoStartPts - m_audioStartPts;
+                qDebug() << "[同步] 音视频偏移:" << m_avSyncOffset << "秒";
             }
-            hasFrame = true;
-            break;
+        }
+        
+        // 获取音频主时钟
+        double refClock = m_audioClock + m_avSyncOffset;
+        double diff = framePts - refClock;  // diff > 0: 视频快, diff < 0: 视频慢
+        
+        // 同步阈值
+        const double MIN_SYNC_THRESHOLD = 0.01;   // 10ms
+        const double MAX_SYNC_THRESHOLD = 0.1;    // 100ms
+        const double NOSYNC_THRESHOLD = 10.0;     // 10秒：超过这个值不同步
+        const double FRAMEDUP_THRESHOLD = 0.1;    // 100ms：帧显示时间超过这个值认为是"长帧"
+        
+        // 计算本帧的基础 delay（与上一帧的时间差）
+        double delay = framePts - m_lastFramePts;
+        if (delay <= 0 || delay > 1.0) {
+            delay = m_lastDelay;  // 异常情况，使用上次的 delay
+        }
+        
+        // 动态同步阈值（根据帧率自适应）
+        double syncThreshold = qMax(MIN_SYNC_THRESHOLD, qMin(MAX_SYNC_THRESHOLD, delay));
+        
+        // ========================================
+        // 动态 delay 同步策略
+        // ========================================
+        if (m_audioClockValid && qAbs(diff) < NOSYNC_THRESHOLD) {
+            if (diff <= -syncThreshold) {
+                // 【视频落后于音频】：加快，减小 delay
+                delay = qMax(0.0, delay + diff);
+                m_consecutiveFastRender++;
+                
+                // 如果连续 10 次快速渲染且落后超过 1 秒，需要丢帧
+                if (m_consecutiveFastRender >= 10 && diff < -1.0) {
+                    int dropped = 0;
+                    while (m_frameQueue.size() > 1 && dropped < 5) {
+                        double nextPts = m_frameQueue.at(1).pts;
+                        if (nextPts < refClock) {
+                            m_frameQueue.dequeue();
+                            m_frameCondition.wakeOne();
+                            dropped++;
+                            framePts = m_frameQueue.head().pts;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (dropped > 0) {
+                        qDebug() << "[AVSync] 视频落后严重，丢帧追赶 dropped=" << dropped
+                                 << "diff(ms)=" << diff * 1000;
+                    }
+                    m_consecutiveFastRender = 0;
+                }
+            }
+            else if (diff >= syncThreshold) {
+                // 【视频快于音频】：减慢，增大 delay
+                m_consecutiveFastRender = 0;
+                
+                if (m_lastDelay > FRAMEDUP_THRESHOLD) {
+                    // 上一帧显示时间很长，直接一步到位
+                    delay = delay + diff;
+                } else {
+                    // 慢慢调整，避免画面突然卡顿
+                    delay = 2 * delay;
+                    // 但不要超过差值，避免过度等待
+                    delay = qMin(delay, delay + diff);
+                }
+            }
+            else {
+                // 在阈值范围内，正常播放
+                m_consecutiveFastRender = 0;
+            }
+        } else {
+            m_consecutiveFastRender = 0;
+        }
+        
+        // 限制 delay 范围
+        const double MIN_DELAY = 0.001;   // 最小 1ms
+        const double MAX_DELAY = 0.5;     // 最大 500ms
+        delay = qBound(MIN_DELAY, delay, MAX_DELAY);
+        
+        // 记录本帧信息
+        m_lastFramePts = framePts;
+        m_lastDelay = delay;
+        
+        // 取出帧
+        frame = m_frameQueue.dequeue();
+        m_frameCondition.wakeOne();
+        hasFrame = true;
+        
+        // 计算下一帧的显示时间
+        m_frameTimer = currentTime + delay;
+        
+        // 日志（每 2 秒）
+        static int syncLogCounter = 0;
+        if (++syncLogCounter >= 125) {  // ~16ms * 125 = 2s
+            syncLogCounter = 0;
+            qDebug() << "[AVSync] diff(ms)=" << QString::number(diff * 1000, 'f', 1)
+                     << "delay(ms)=" << QString::number(delay * 1000, 'f', 1)
+                     << "audio=" << QString::number(refClock, 'f', 2)
+                     << "video=" << QString::number(framePts, 'f', 2)
+                     << "vq=" << m_frameQueue.size();
         }
     }
     
+    // 渲染
     if (hasFrame && frame.texture) {
         if (frame.isBGRA) {
             renderBGRAFrame(frame.texture.Get());
@@ -1054,48 +1259,209 @@ void D3D11Renderer::setupAudio()
 {
     cleanupAudio();
     
+#if SDL3_AVAILABLE
+    // 初始化 SDL3 音频
+    if (!SDL_Init(SDL_INIT_AUDIO)) {
+        qWarning() << "SDL3 音频初始化失败:" << SDL_GetError();
+        return;
+    }
+    
+    // SDL3 使用 AudioStream API
+    SDL_AudioSpec spec;
+    spec.freq = 44100;
+    spec.format = SDL_AUDIO_S16;
+    spec.channels = 2;
+    
+    m_sdlAudioStream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+        &spec,
+        nullptr,  // SDL3 不用回调，用流式 API
+        nullptr
+    );
+    
+    if (!m_sdlAudioStream) {
+        qWarning() << "SDL3 打开音频设备失败:" << SDL_GetError();
+        return;
+    }
+    
+    // 开始播放
+    SDL_ResumeAudioStreamDevice(m_sdlAudioStream);
+    m_audioWrittenBytes = 0;
+    qDebug() << "SDL3 音频初始化成功";
+    
+#else
+    // Qt 音频备用方案
     QAudioFormat format;
     format.setSampleRate(44100);
     format.setChannelCount(2);
     format.setSampleFormat(QAudioFormat::Int16);
     
     m_audioSink = std::make_unique<QAudioSink>(format);
+    m_audioSink->setBufferSize(44100 * 2 * 2 / 5);
     m_audioSink->setVolume(m_volume / 100.0f);
     m_audioDevice = m_audioSink->start();
+#endif
 }
 
 void D3D11Renderer::cleanupAudio()
 {
+#if SDL3_AVAILABLE
+    if (m_sdlAudioStream) {
+        SDL_DestroyAudioStream(m_sdlAudioStream);
+        m_sdlAudioStream = nullptr;
+    }
+    m_audioWrittenBytes = 0;
+#else
     if (m_audioSink) {
         m_audioSink->stop();
         m_audioSink.reset();
     }
     m_audioDevice = nullptr;
+#endif
 }
 
 void D3D11Renderer::processAudio()
 {
-    if (!m_playing || m_paused || !m_audioDevice) return;
+    if (!m_playing || m_paused) return;
     
-    AudioData ad;
-    while (true) {
-        {
-            QMutexLocker locker(&m_audioMutex);
-            if (m_audioQueue.isEmpty()) break;
-            ad = m_audioQueue.dequeue();
+#if SDL3_AVAILABLE
+    if (!m_sdlAudioStream) return;
+    
+    QMutexLocker locker(&m_audioMutex);
+    
+    // 获取 SDL 音频流中排队的数据量
+    int queued = SDL_GetAudioStreamQueued(m_sdlAudioStream);
+    
+    // 日志：每 2 秒输出一次
+    static int audioLogCounter = 0;
+    if (++audioLogCounter >= 400) {  // 5ms * 400 = 2秒
+        audioLogCounter = 0;
+        qDebug() << "[状态] 音频队列:" << m_audioQueue.size() 
+                 << "SDL:" << queued / 1000 << "KB"
+                 << "时钟:" << QString::number(m_audioClock, 'f', 2);
+    }
+    
+    // 如果队列太满（超过 200ms 的数据），等待
+    const int maxQueued = 44100 * 2 * 2 / 5;  // 200ms
+    if (queued > maxQueued) {
+        // 不写入更多数据，让 SDL 先消费
+    } else {
+        // 向 SDL 写入音频数据
+        while (!m_audioQueue.isEmpty() && queued < maxQueued) {
+            AudioData &ad = m_audioQueue.head();
+            
+            // 记录第一帧音频 PTS
+            if (!m_audioClockValid) {
+                m_audioStartPts = ad.pts;
+                m_audioClockValid = true;
+                qDebug() << "[音频] 首帧 PTS:" << m_audioStartPts;
+                
+                // 如果视频已经开始，计算偏移
+                if (m_videoClockValid) {
+                    m_avSyncOffset = m_videoStartPts - m_audioStartPts;
+                    qDebug() << "[同步] 音视频偏移:" << m_avSyncOffset << "秒";
+                }
+            }
+            
+            // 音量调整
+            if (m_volume < 100) {
+                int16_t *samples = reinterpret_cast<int16_t*>(ad.data.data());
+                int count = ad.data.size() / 2;
+                float volumeScale = m_volume / 100.0f;
+                for (int i = 0; i < count; i++) {
+                    samples[i] = static_cast<int16_t>(samples[i] * volumeScale);
+                }
+            }
+            
+            // 写入 SDL 音频流
+            if (SDL_PutAudioStreamData(m_sdlAudioStream, ad.data.constData(), ad.data.size())) {
+                m_audioWrittenBytes += ad.data.size();
+                m_audioQueue.dequeue();
+                queued = SDL_GetAudioStreamQueued(m_sdlAudioStream);
+            } else {
+                qWarning() << "SDL 音频写入失败:" << SDL_GetError();
+                break;
+            }
+        }
+    }
+    
+    // 【关键】计算音频时钟
+    // 已写入字节数 - SDL队列中的字节数 = 已播放字节数
+    if (m_audioClockValid) {
+        qint64 playedBytes = m_audioWrittenBytes - queued;
+        if (playedBytes < 0) playedBytes = 0;
+        // 44100 采样率，2 通道，2 字节/样本 = 176400 字节/秒
+        double playedSeconds = static_cast<double>(playedBytes) / 176400.0;
+        m_audioClock = m_audioStartPts + playedSeconds;
+    }
+    
+    // 每 2 秒输出同步状态
+    static int logCounter = 0;
+    if (++logCounter >= 400) {  // 5ms * 400 = 2秒
+        logCounter = 0;
+        double correctedClock = m_audioClock + m_avSyncOffset;
+        double diff = m_currentPts - correctedClock;
+        qDebug() << "[同步] 音频:" << QString::number(correctedClock, 'f', 2)
+                 << "视频:" << QString::number(m_currentPts, 'f', 2)
+                 << "差:" << QString::number(diff * 1000, 'f', 0) << "ms";
+    }
+
+    // 额外的“断粮”监测日志：如果音频队列空且 SDL 缓冲也很小，定期提示
+    if (m_audioQueue.isEmpty() && queued < 4096) {
+        static int starvingLogCounter = 0;
+        if (++starvingLogCounter >= 200) { // ~1s
+            starvingLogCounter = 0;
+            qDebug() << "[音频] 可能断粮: audioQueue=0, SDLqKB=" << queued / 1024
+                     << "audioClock=" << m_audioClock;
+        }
+    }
+    
+#else
+    // Qt 音频备用方案
+    if (!m_audioDevice) return;
+    
+    QMutexLocker locker(&m_audioMutex);
+    
+    QAudio::State state = m_audioSink->state();
+    if (state == QAudio::SuspendedState) {
+        m_audioSink->resume();
+    }
+    
+    while (!m_audioQueue.isEmpty()) {
+        qint64 bytesFree = m_audioSink->bytesFree();
+        if (bytesFree < 2048) break;
+        
+        AudioData &ad = m_audioQueue.head();
+        
+        if (!m_audioClockValid) {
+            m_audioStartPts = ad.pts;
+            m_audioClockValid = true;
         }
         
         if (m_volume < 100) {
             int16_t *samples = reinterpret_cast<int16_t*>(ad.data.data());
             int count = ad.data.size() / 2;
+            float volumeScale = m_volume / 100.0f;
             for (int i = 0; i < count; i++) {
-                samples[i] = static_cast<int16_t>(samples[i] * m_volume / 100);
+                samples[i] = static_cast<int16_t>(samples[i] * volumeScale);
             }
         }
         
-        m_audioDevice->write(ad.data);
-        m_audioClock = ad.pts + static_cast<double>(ad.data.size()) / (44100 * 2 * 2);
+        qint64 written = m_audioDevice->write(ad.data);
+        if (written > 0) {
+            m_audioWrittenBytes += written;
+            m_audioQueue.dequeue();
+        } else {
+            break;
+        }
     }
+    
+    // Qt 音频时钟
+    if (m_audioClockValid && m_audioSink) {
+        qint64 processedUs = m_audioSink->processedUSecs();
+        m_audioClock = m_audioStartPts + processedUs / 1000000.0;
+    }
+#endif
 }
 
 void D3D11Renderer::paintEvent(QPaintEvent *event)
@@ -1109,4 +1475,7 @@ void D3D11Renderer::resizeEvent(QResizeEvent *event)
     QWidget::resizeEvent(event);
     resizeSwapChain();
 }
+
+
+
 
