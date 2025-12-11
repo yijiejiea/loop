@@ -9,12 +9,12 @@
 #include <QTimer>
 #include <QPushButton>
 
-class MpvWidget;
+class D3D11Renderer;
 
 /**
  * @brief 悬浮视频播放器窗口类
  * 
- * 使用 libmpv 进行视频播放，功能特性：
+ * 使用 FFmpeg 进行视频播放，功能特性：
  * - 无边框悬浮窗口，始终置顶
  * - 支持视频无限循环播放
  * - 支持几乎所有视频格式（FFmpeg 支持的都能播放）
@@ -56,6 +56,8 @@ protected:
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
 
 private slots:
     void onPositionChanged(double seconds);
@@ -88,8 +90,8 @@ private:
     void updateCursor(ResizeEdge edge);
 
 private:
-    // MPV 播放器
-    MpvWidget *m_mpvWidget;
+    // 视频播放器 (D3D11 硬件加速)
+    D3D11Renderer *m_videoWidget;
 
     // 控制栏
     QWidget *m_controlBar;

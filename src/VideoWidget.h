@@ -1,27 +1,24 @@
-#ifndef MPVWIDGET_H
-#define MPVWIDGET_H
+#ifndef VIDEOWIDGET_H
+#define VIDEOWIDGET_H
 
 #include <QWidget>
+#include <QImage>
 #include <QTimer>
-
-#if MPV_AVAILABLE
-#include <mpv/client.h>
-#include <mpv/render_gl.h>
-#endif
+#include "FFmpegPlayer.h"
 
 /**
- * @brief MPV 视频渲染组件
+ * @brief 视频渲染组件
  * 
- * 使用 libmpv 进行视频播放，支持几乎所有视频格式。
- * 通过 OpenGL 进行硬件加速渲染。
+ * 使用 FFmpeg 进行视频播放，支持几乎所有视频格式。
+ * 通过 QPainter 进行渲染。
  */
-class MpvWidget : public QWidget
+class VideoWidget : public QWidget
 {
     Q_OBJECT
 
 public:
-    explicit MpvWidget(QWidget *parent = nullptr);
-    ~MpvWidget();
+    explicit VideoWidget(QWidget *parent = nullptr);
+    ~VideoWidget();
 
     /**
      * @brief 加载并播放视频文件
@@ -125,31 +122,26 @@ signals:
 
 protected:
     void paintEvent(QPaintEvent *event) override;
-    bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private slots:
-    void onMpvEvents();
-    void updatePosition();
+    void onFrameReady(const QImage &frame);
+    void onStateChanged(FFmpegPlayer::PlaybackState state);
+    void onPositionChanged(double seconds);
+    void onDurationChanged(double seconds);
+    void onFileLoaded();
+    void onEndOfFile();
+    void onErrorOccurred(const QString &error);
 
 private:
-    void initMpv();
-    void handleMpvEvent(void *event);
-    void setProperty(const char *name, const char *value);
-    void setPropertyBool(const char *name, bool value);
-    void setPropertyDouble(const char *name, double value);
-    void setPropertyInt(const char *name, int value);
-    void command(const QStringList &args);
+    void updateScaledFrame();
 
-#if MPV_AVAILABLE
-    mpv_handle *m_mpv = nullptr;
-#else
-    void *m_mpv = nullptr;
-#endif
-
-    QTimer *m_positionTimer;
-    double m_duration = 0;
-    bool m_playing = false;
+    FFmpegPlayer *m_player;
+    QImage m_currentFrame;
+    QImage m_scaledFrame;
+    QRect m_videoRect;
+    bool m_keepAspectRatio = true;
 };
 
-#endif // MPVWIDGET_H
+#endif // VIDEOWIDGET_H
 

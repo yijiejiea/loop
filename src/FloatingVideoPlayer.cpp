@@ -1,5 +1,5 @@
 #include "FloatingVideoPlayer.h"
-#include "MpvWidget.h"
+#include "D3D11Renderer.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -13,6 +13,9 @@
 #include <QActionGroup>
 #include <QMessageBox>
 #include <QFileInfo>
+#include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 
 FloatingVideoPlayer::FloatingVideoPlayer(QWidget *parent)
     : QWidget(parent)
@@ -24,6 +27,7 @@ FloatingVideoPlayer::FloatingVideoPlayer(QWidget *parent)
     
     setAttribute(Qt::WA_TranslucentBackground);
     setMouseTracking(true);
+    setAcceptDrops(true);  // 启用拖放功能
 
     // 默认大小和位置
     resize(400, 300);
@@ -49,21 +53,21 @@ void FloatingVideoPlayer::setupUI()
     mainLayout->setContentsMargins(EDGE_MARGIN, EDGE_MARGIN, EDGE_MARGIN, EDGE_MARGIN);
     mainLayout->setSpacing(0);
 
-    // MPV 视频组件
-    m_mpvWidget = new MpvWidget(this);
-    m_mpvWidget->setMouseTracking(true);
-    mainLayout->addWidget(m_mpvWidget);
+    // D3D11 硬件加速视频组件
+    m_videoWidget = new D3D11Renderer(this);
+    m_videoWidget->setMouseTracking(true);
+    mainLayout->addWidget(m_videoWidget);
 
-    // 连接 MPV 信号
-    connect(m_mpvWidget, &MpvWidget::positionChanged, 
+    // 连接 D3D11 播放器信号
+    connect(m_videoWidget, &D3D11Renderer::positionChanged, 
             this, &FloatingVideoPlayer::onPositionChanged);
-    connect(m_mpvWidget, &MpvWidget::durationChanged, 
+    connect(m_videoWidget, &D3D11Renderer::durationChanged, 
             this, &FloatingVideoPlayer::onDurationChanged);
-    connect(m_mpvWidget, &MpvWidget::playbackStateChanged, 
+    connect(m_videoWidget, &D3D11Renderer::playbackStateChanged, 
             this, &FloatingVideoPlayer::onPlaybackStateChanged);
-    connect(m_mpvWidget, &MpvWidget::fileLoaded, 
+    connect(m_videoWidget, &D3D11Renderer::fileLoaded, 
             this, &FloatingVideoPlayer::onFileLoaded);
-    connect(m_mpvWidget, &MpvWidget::errorOccurred, 
+    connect(m_videoWidget, &D3D11Renderer::errorOccurred, 
             this, &FloatingVideoPlayer::onErrorOccurred);
 
     // 创建控制栏
@@ -128,7 +132,7 @@ void FloatingVideoPlayer::createControlBar()
         m_isSliderDragging = false;
         if (m_duration > 0) {
             double seekPos = (m_progressSlider->value() / 1000.0) * m_duration;
-            m_mpvWidget->seek(seekPos);
+            m_videoWidget->seek(seekPos);
         }
     });
     connect(m_progressSlider, &QSlider::sliderMoved, [this](int value) {
@@ -184,9 +188,9 @@ void FloatingVideoPlayer::createControlBar()
     controlLayout->addLayout(buttonLayout);
 
     // 控制栏位置
-    m_controlBar->setParent(m_mpvWidget);
-    m_controlBar->move(0, m_mpvWidget->height() - m_controlBar->height());
-    m_controlBar->resize(m_mpvWidget->width(), m_controlBar->height());
+    m_controlBar->setParent(m_videoWidget);
+    m_controlBar->move(0, m_videoWidget->height() - m_controlBar->height());
+    m_controlBar->resize(m_videoWidget->width(), m_controlBar->height());
 
     // 隐藏定时器
     m_hideControlTimer = new QTimer(this);
@@ -289,7 +293,7 @@ void FloatingVideoPlayer::openVideo(const QString &filePath)
 {
     if (filePath.isEmpty()) return;
     
-    m_mpvWidget->loadFile(filePath);
+    m_videoWidget->loadFile(filePath);
     
     QFileInfo fileInfo(filePath);
     setWindowTitle(QString("Loop - %1").arg(fileInfo.fileName()));
@@ -297,29 +301,29 @@ void FloatingVideoPlayer::openVideo(const QString &filePath)
 
 void FloatingVideoPlayer::play()
 {
-    m_mpvWidget->play();
+    m_videoWidget->play();
 }
 
 void FloatingVideoPlayer::pause()
 {
-    m_mpvWidget->pause();
+    m_videoWidget->pause();
 }
 
 void FloatingVideoPlayer::stop()
 {
-    m_mpvWidget->stop();
+    m_videoWidget->stop();
     m_progressSlider->setValue(0);
     m_timeLabel->setText("00:00 / 00:00");
 }
 
 void FloatingVideoPlayer::togglePlayPause()
 {
-    m_mpvWidget->togglePause();
+    m_videoWidget->togglePause();
 }
 
 void FloatingVideoPlayer::setVolume(int volume)
 {
-    m_mpvWidget->setVolume(volume);
+    m_videoWidget->setVolume(volume);
 }
 
 void FloatingVideoPlayer::setOpacityLevel(qreal opacity)
@@ -511,9 +515,9 @@ void FloatingVideoPlayer::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
     
-    if (m_controlBar && m_mpvWidget) {
-        m_controlBar->resize(m_mpvWidget->width(), m_controlBar->height());
-        m_controlBar->move(0, m_mpvWidget->height() - m_controlBar->height());
+    if (m_controlBar && m_videoWidget) {
+        m_controlBar->resize(m_videoWidget->width(), m_controlBar->height());
+        m_controlBar->move(0, m_videoWidget->height() - m_controlBar->height());
     }
 }
 
@@ -543,5 +547,44 @@ void FloatingVideoPlayer::updateCursor(ResizeEdge edge)
     default:
         setCursor(Qt::ArrowCursor); break;
     }
+}
+
+void FloatingVideoPlayer::dragEnterEvent(QDragEnterEvent *event)
+{
+    // 检查是否包含文件URL
+    if (event->mimeData()->hasUrls()) {
+        const QList<QUrl> urls = event->mimeData()->urls();
+        for (const QUrl &url : urls) {
+            if (url.isLocalFile()) {
+                QString filePath = url.toLocalFile();
+                // 检查是否是支持的视频格式
+                QStringList videoExtensions = {
+                    "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm",
+                    "m4v", "ts", "m2ts", "rmvb", "rm", "3gp", "mpg",
+                    "mpeg", "vob", "ogv", "mts"
+                };
+                QString ext = QFileInfo(filePath).suffix().toLower();
+                if (videoExtensions.contains(ext)) {
+                    event->acceptProposedAction();
+                    return;
+                }
+            }
+        }
+    }
+    event->ignore();
+}
+
+void FloatingVideoPlayer::dropEvent(QDropEvent *event)
+{
+    const QList<QUrl> urls = event->mimeData()->urls();
+    for (const QUrl &url : urls) {
+        if (url.isLocalFile()) {
+            QString filePath = url.toLocalFile();
+            openVideo(filePath);
+            event->acceptProposedAction();
+            return;
+        }
+    }
+    event->ignore();
 }
 
