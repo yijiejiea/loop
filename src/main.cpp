@@ -1,32 +1,27 @@
 #include <QApplication>
 #include <QCommandLineParser>
-#include <QCommandLineOption>
 #include <QFileInfo>
 #include "FloatingVideoPlayer.h"
 
 /**
  * @brief 主程序入口
  * 
- * 支持命令行参数：
- * - 直接传入视频文件路径进行播放
- * - --help 显示帮助信息
+ * Loop Video Player - 悬浮视频循环播放器
+ * 基于 libmpv，支持几乎所有视频格式
  * 
- * 使用示例：
- * - LoopVideoPlayer                    启动空白播放器
- * - LoopVideoPlayer video.mp4          启动并播放 video.mp4
+ * 使用方式：
+ * - LoopVideoPlayer              启动空白播放器
+ * - LoopVideoPlayer video.mp4    启动并播放视频
  */
 int main(int argc, char *argv[])
 {
-    // 创建应用程序
     QApplication app(argc, argv);
     app.setApplicationName("Loop Video Player");
-    app.setApplicationVersion("1.0.0");
+    app.setApplicationVersion("2.0.0");
     app.setOrganizationName("LoopPlayer");
-
-    // 设置应用程序样式
     app.setStyle("Fusion");
 
-    // 全局样式表
+    // 全局样式
     app.setStyleSheet(R"(
         QToolTip {
             background-color: #1a1a2e;
@@ -39,30 +34,24 @@ int main(int argc, char *argv[])
 
     // 命令行解析
     QCommandLineParser parser;
-    parser.setApplicationDescription("悬浮视频循环播放器 - 一个轻量级的视频循环播放工具");
+    parser.setApplicationDescription("悬浮视频循环播放器 - 基于 libmpv，支持几乎所有视频格式");
     parser.addHelpOption();
     parser.addVersionOption();
-    parser.addPositionalArgument("file", "要播放的视频文件路径", "[video file]");
-
+    parser.addPositionalArgument("file", "视频文件路径", "[video file]");
     parser.process(app);
 
-    // 创建播放器窗口
+    // 创建播放器
     FloatingVideoPlayer player;
     player.show();
 
-    // 如果提供了文件参数，打开视频
+    // 打开命令行指定的文件
     const QStringList args = parser.positionalArguments();
     if (!args.isEmpty()) {
-        QString filePath = args.first();
-        QFileInfo fileInfo(filePath);
-        
+        QFileInfo fileInfo(args.first());
         if (fileInfo.exists() && fileInfo.isFile()) {
             player.openVideo(fileInfo.absoluteFilePath());
-        } else {
-            qWarning() << "文件不存在:" << filePath;
         }
     }
 
     return app.exec();
 }
-
