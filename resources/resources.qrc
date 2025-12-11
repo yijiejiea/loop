@@ -1,0 +1,7 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <!-- 未来可以添加图标等资源 -->
+    </qresource>
+</RCC>
+
