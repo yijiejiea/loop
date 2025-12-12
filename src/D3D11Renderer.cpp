@@ -401,6 +401,7 @@ bool D3D11Renderer::openFile(const QString &filename)
             m_audioStreamIndex = i;
         }
     }
+    m_hasAudio = (m_audioStreamIndex >= 0);
     
     // 初始化视频解码器（D3D11VA 硬件加速）
     if (m_videoStreamIndex >= 0) {
@@ -612,6 +613,7 @@ void D3D11Renderer::closeFile()
     
     m_videoStreamIndex = -1;
     m_audioStreamIndex = -1;
+    m_hasAudio = false;
     m_duration = 0;
     m_videoWidth = 0;
     m_videoHeight = 0;
@@ -632,6 +634,8 @@ void D3D11Renderer::play()
     
     if (!m_playing) {
         setupAudio();
+        m_loopStartMs = QDateTime::currentMSecsSinceEpoch();
+        m_holdAudioAfterLoop = false; // 首次播放不阻塞音频
         
 #if FFMPEG_AVAILABLE
         // 启动三线程架构
@@ -890,22 +894,54 @@ void D3D11Renderer::demuxThread()
             
             if (ret == AVERROR_EOF) {
                 if (m_loop) {
-                    // 循环播放：回到开头
-                    av_seek_frame(m_formatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
+                    // 在主线程重置同步/音频状态，避免下一轮累积时钟导致不同步
+                    QMetaObject::invokeMethod(this, [this]() {
+                        resetSyncStateOnLoop();
+                    }, Qt::QueuedConnection);
                     
-                    // 通知解码线程 flush
-                    {
-                        QMutexLocker locker(&m_videoPacketMutex);
-                        // 插入 nullptr 作为 flush 信号
-                        m_videoPacketQueue.enqueue(nullptr);
-                        m_videoPacketCondition.wakeOne();
-                    }
-                    {
-                        QMutexLocker locker(&m_audioPacketMutex);
-                        m_audioPacketQueue.enqueue(nullptr);
-                        m_audioPacketCondition.wakeOne();
-                    }
-                    continue;
+        // 循环播放：先 flush，让尾部帧被解码/消费，再重启
+        {
+            QMutexLocker locker(&m_videoPacketMutex);
+            m_videoPacketQueue.enqueue(nullptr);
+            m_videoPacketCondition.wakeOne();
+        }
+        {
+            QMutexLocker locker(&m_audioPacketMutex);
+            m_audioPacketQueue.enqueue(nullptr);
+            m_audioPacketCondition.wakeOne();
+        }
+
+        qint64 waitStart = QDateTime::currentMSecsSinceEpoch();
+        while (m_running) {
+            bool pktEmpty, frameEmpty, audioEmpty;
+            {
+                QMutexLocker l1(&m_videoPacketMutex);
+                QMutexLocker l2(&m_audioPacketMutex);
+                pktEmpty = m_videoPacketQueue.isEmpty() && m_audioPacketQueue.isEmpty();
+            }
+            {
+                QMutexLocker l3(&m_frameMutex);
+                frameEmpty = m_frameQueue.isEmpty();
+            }
+            {
+                QMutexLocker l4(&m_audioMutex);
+                audioEmpty = m_audioQueue.isEmpty();
+            }
+            if (pktEmpty && frameEmpty && audioEmpty) break;
+            if (QDateTime::currentMSecsSinceEpoch() - waitStart > 2000) {
+                qDebug() << "[Loop] drain timeout, force restart";
+                break;
+            }
+            QThread::msleep(5);
+        }
+
+        QMetaObject::invokeMethod(this, [this]() {
+            resetSyncStateOnLoop();
+        }, Qt::QueuedConnection);
+
+        // 重绕
+        av_seek_frame(m_formatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
+        continue;
                 }
                 emit endOfFile();
             }
@@ -1017,7 +1053,7 @@ void D3D11Renderer::videoDecodeThread()
             if (frame->pts != AV_NOPTS_VALUE) {
                 pts = frame->pts * av_q2d(stream->time_base);
             }
-            
+
             VideoFrame vf;
             vf.pts = pts;
             
@@ -1255,12 +1291,40 @@ void D3D11Renderer::onRenderTimer()
         
         if (m_frameQueue.isEmpty()) return;
         
+        // 循环开始时，先等待音频预热，避免第一帧画面抢先导致感知“音画错位”
+    // 仅在非“音频 hold”场景下，才等待音频预热
+    if (!m_holdAudioAfterLoop && m_hasAudio && !m_audioClockValid) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const qint64 elapsedMs = m_loopStartMs > 0 ? (nowMs - m_loopStartMs) : 0;
+        const qint64 prerollBytes = 176400 / 5; // 约 200ms 的音频数据
+        bool audioReady = (m_audioWrittenBytes >= prerollBytes);
+        if (!audioReady) {
+            if (!m_loggedHoldWait && elapsedMs > 50) {
+                m_loggedHoldWait = true;
+                qDebug() << "[Loop] wait audio preroll, writtenBytes=" << m_audioWrittenBytes
+                         << "elapsedMs=" << elapsedMs;
+            }
+            // 防止音频阻塞导致的卡死：超过 400ms 仍未预热则放行画面
+            if (elapsedMs <= 400) {
+                return;
+            } else {
+                qDebug() << "[Loop] preroll timeout, release video, writtenBytes=" << m_audioWrittenBytes
+                         << "elapsedMs=" << elapsedMs;
+            }
+        }
+    }
+        
         framePts = m_frameQueue.head().pts;
         
         // 记录视频首帧 PTS
         if (!m_videoClockValid) {
             m_videoStartPts = framePts;
             m_videoClockValid = true;
+            m_holdAudioAfterLoop = false; // 视频首帧已就绪，允许音频输出
+            if (!m_loggedHoldRelease) {
+                qDebug() << "[Loop] video first frame ready, release audio hold, pts=" << framePts;
+                m_loggedHoldRelease = true;
+            }
             m_frameTimer = currentTime;  // 初始化 frame timer
             m_lastFramePts = framePts;
             qDebug() << "[视频] 首帧 PTS:" << m_videoStartPts;
@@ -1572,6 +1636,20 @@ void D3D11Renderer::processAudio()
 #if SDL3_AVAILABLE
     if (!m_sdlAudioStream) return;
     
+    // 循环首帧前，先等视频就绪，最多等待 500ms
+    if (m_holdAudioAfterLoop && !m_videoClockValid) {
+        qint64 elapsedMs = m_loopStartMs > 0 ? (QDateTime::currentMSecsSinceEpoch() - m_loopStartMs) : 0;
+        if (elapsedMs <= 400) {
+            if (!m_loggedHoldWait && elapsedMs > 30) {
+                m_loggedHoldWait = true;
+                qDebug() << "[Loop] hold audio (SDL) waiting video, elapsedMs=" << elapsedMs;
+            }
+            return;
+        }
+        m_holdAudioAfterLoop = false; // 超时，放行音频，避免长时间静音
+        qDebug() << "[Loop] hold audio timeout (SDL), release, elapsedMs=" << elapsedMs;
+    }
+    
     QMutexLocker locker(&m_audioMutex);
     
     // 获取 SDL 音频流中排队的数据量
@@ -1666,6 +1744,20 @@ void D3D11Renderer::processAudio()
     // Qt 音频备用方案
     if (!m_audioDevice) return;
     
+    // 循环首帧前，先等视频就绪，最多等待 500ms
+    if (m_holdAudioAfterLoop && !m_videoClockValid) {
+        qint64 elapsedMs = m_loopStartMs > 0 ? (QDateTime::currentMSecsSinceEpoch() - m_loopStartMs) : 0;
+        if (elapsedMs <= 400) {
+            if (!m_loggedHoldWait && elapsedMs > 30) {
+                m_loggedHoldWait = true;
+                qDebug() << "[Loop] hold audio (Qt) waiting video, elapsedMs=" << elapsedMs;
+            }
+            return;
+        }
+        m_holdAudioAfterLoop = false; // 超时放行，避免长时间静音
+        qDebug() << "[Loop] hold audio timeout (Qt), release, elapsedMs=" << elapsedMs;
+    }
+    
     QMutexLocker locker(&m_audioMutex);
     
     QAudio::State state = m_audioSink->state();
@@ -1730,6 +1822,50 @@ void D3D11Renderer::processAudio()
         m_audioClock = m_audioStartPts + processedUs / 1000000.0;
     }
 #endif
+}
+
+void D3D11Renderer::resetSyncStateOnLoop()
+{
+    // 重置同步状态
+    m_audioClockValid = false;
+    m_videoClockValid = false;
+    m_audioStartPts = 0;
+    m_videoStartPts = 0;
+    m_avSyncOffset = 0;
+    m_audioClock = 0;
+    m_audioWrittenBytes = 0;
+    m_skipRenderCount = 0;
+    m_frameTimer = 0;
+    m_lastFramePts = 0;
+    m_lastDelay = 0.033;
+    m_consecutiveFastRender = 0;
+    m_currentPts = 0;
+    m_loopStartMs = QDateTime::currentMSecsSinceEpoch();
+    m_holdAudioAfterLoop = m_hasAudio; // 有音频时，循环首帧等待视频就绪再放音
+    m_loggedHoldWait = false;
+    m_loggedHoldRelease = false;
+    
+    // 清空解码后的音频队列，防止旧数据残留
+    {
+        QMutexLocker locker(&m_audioMutex);
+        m_audioQueue.clear();
+    }
+    
+#if SDL3_AVAILABLE
+    if (m_sdlAudioStream) {
+        SDL_ClearAudioStream(m_sdlAudioStream);
+    }
+#else
+    // Qt 音频：重启输出以清零内部缓冲与 processedUSecs
+    if (m_audioSink) {
+        m_audioSink->stop();
+        m_audioSink->reset();
+        m_audioSink->setVolume(m_volume / 100.0f);
+        m_audioDevice = m_audioSink->start();
+    }
+#endif
+
+    qDebug() << "[Loop] reset sync state, holdAudio" << m_holdAudioAfterLoop;
 }
 
 void D3D11Renderer::paintEvent(QPaintEvent *event)

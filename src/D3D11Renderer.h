@@ -130,6 +130,9 @@ private:
     void setupAudio();
     void cleanupAudio();
     void processAudio();
+    
+    // 循环播放时重置同步与音频输出状态
+    void resetSyncStateOnLoop();
 
 private:
 #ifdef _WIN32
@@ -217,6 +220,11 @@ private:
     // 视频信息
     int m_videoWidth = 0;
     int m_videoHeight = 0;
+    bool m_hasAudio = false;       // 是否存在音频流
+    qint64 m_loopStartMs = 0;      // 本轮循环/播放起始时间戳（用于渲染前等待音频预热）
+    bool m_holdAudioAfterLoop = false; // 循环首帧前暂缓音频输出，等待视频就绪
+    bool m_loggedHoldWait = false;     // 日志控制：等待视频时已输出
+    bool m_loggedHoldRelease = false;  // 日志控制：放行音频已输出
     
     // 定时器
     QTimer *m_renderTimer = nullptr;
