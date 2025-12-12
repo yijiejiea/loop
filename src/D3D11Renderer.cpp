@@ -531,18 +531,49 @@ bool D3D11Renderer::initHardwareDecoder(const AVCodec *codec)
 void D3D11Renderer::closeFile()
 {
 #if FFMPEG_AVAILABLE
+    // 停止所有线程
     m_running = false;
     m_frameCondition.wakeAll();
+    m_videoPacketCondition.wakeAll();
+    m_audioPacketCondition.wakeAll();
     
-    if (m_decodeThread && m_decodeThread->isRunning()) {
-        m_decodeThread->quit();
-        m_decodeThread->wait(1000);
+    // 等待线程结束
+    if (m_demuxThread && m_demuxThread->isRunning()) {
+        m_demuxThread->quit();
+        m_demuxThread->wait(1000);
     }
-    m_decodeThread.reset();
+    m_demuxThread.reset();
     
+    if (m_videoDecodeThread && m_videoDecodeThread->isRunning()) {
+        m_videoDecodeThread->quit();
+        m_videoDecodeThread->wait(1000);
+    }
+    m_videoDecodeThread.reset();
+    
+    if (m_audioDecodeThread && m_audioDecodeThread->isRunning()) {
+        m_audioDecodeThread->quit();
+        m_audioDecodeThread->wait(1000);
+    }
+    m_audioDecodeThread.reset();
+    
+    // 清空所有队列
     {
         QMutexLocker locker(&m_frameMutex);
         m_frameQueue.clear();
+    }
+    {
+        QMutexLocker locker(&m_videoPacketMutex);
+        while (!m_videoPacketQueue.isEmpty()) {
+            AVPacket *pkt = m_videoPacketQueue.dequeue();
+            if (pkt) av_packet_free(&pkt);
+        }
+    }
+    {
+        QMutexLocker locker(&m_audioPacketMutex);
+        while (!m_audioPacketQueue.isEmpty()) {
+            AVPacket *pkt = m_audioPacketQueue.dequeue();
+            if (pkt) av_packet_free(&pkt);
+        }
     }
     {
         QMutexLocker locker(&m_audioMutex);
@@ -602,16 +633,42 @@ void D3D11Renderer::play()
     if (!m_playing) {
         setupAudio();
         
-        // 启动解码线程
+#if FFMPEG_AVAILABLE
+        // 启动三线程架构
         m_running = true;
-        m_decodeThread = std::make_unique<QThread>();
-        QThread *thread = m_decodeThread.get();
         
-        connect(thread, &QThread::started, [this]() {
-            decodeThread();
+        // 1. Demux 线程
+        m_demuxThread = std::make_unique<QThread>();
+        connect(m_demuxThread.get(), &QThread::started, [this]() {
+            demuxThread();
         });
+        m_demuxThread->start();
         
-        thread->start();
+        // 2. 视频解码线程
+        if (m_videoCodecCtx) {
+            m_videoDecodeThread = std::make_unique<QThread>();
+            connect(m_videoDecodeThread.get(), &QThread::started, [this]() {
+                videoDecodeThread();
+            });
+            m_videoDecodeThread->start();
+        }
+        
+        // 3. 音频解码线程
+        if (m_audioCodecCtx && m_swrCtx) {
+            m_audioDecodeThread = std::make_unique<QThread>();
+            connect(m_audioDecodeThread.get(), &QThread::started, [this]() {
+                audioDecodeThread();
+            });
+            m_audioDecodeThread->start();
+        }
+        
+        qDebug() << "========================================";
+        qDebug() << "三线程架构已启动:";
+        qDebug() << "  - Demux 线程: 读取 Packet";
+        qDebug() << "  - 视频解码线程: D3D11VA 硬件解码";
+        qDebug() << "  - 音频解码线程: FFmpeg 软解码";
+        qDebug() << "========================================";
+#endif
     }
     
     m_playing = true;
@@ -669,20 +726,60 @@ void D3D11Renderer::stop()
     m_renderTimer->stop();
     m_audioTimer->stop();
     
+    // 停止三线程
     m_running = false;
-    m_frameCondition.wakeAll();
     
-    if (m_decodeThread && m_decodeThread->isRunning()) {
-        m_decodeThread->quit();
-        m_decodeThread->wait(1000);
+    // 唤醒所有等待的线程
+    m_frameCondition.wakeAll();
+    m_videoPacketCondition.wakeAll();
+    m_audioPacketCondition.wakeAll();
+    
+    // 等待线程结束
+    if (m_demuxThread && m_demuxThread->isRunning()) {
+        m_demuxThread->quit();
+        m_demuxThread->wait(1000);
     }
+    m_demuxThread.reset();
+    
+    if (m_videoDecodeThread && m_videoDecodeThread->isRunning()) {
+        m_videoDecodeThread->quit();
+        m_videoDecodeThread->wait(1000);
+    }
+    m_videoDecodeThread.reset();
+    
+    if (m_audioDecodeThread && m_audioDecodeThread->isRunning()) {
+        m_audioDecodeThread->quit();
+        m_audioDecodeThread->wait(1000);
+    }
+    m_audioDecodeThread.reset();
     
     cleanupAudio();
     
+    // 清空所有队列
+#if FFMPEG_AVAILABLE
     {
         QMutexLocker locker(&m_frameMutex);
         m_frameQueue.clear();
     }
+    {
+        QMutexLocker locker(&m_videoPacketMutex);
+        while (!m_videoPacketQueue.isEmpty()) {
+            AVPacket *pkt = m_videoPacketQueue.dequeue();
+            if (pkt) av_packet_free(&pkt);
+        }
+    }
+    {
+        QMutexLocker locker(&m_audioPacketMutex);
+        while (!m_audioPacketQueue.isEmpty()) {
+            AVPacket *pkt = m_audioPacketQueue.dequeue();
+            if (pkt) av_packet_free(&pkt);
+        }
+    }
+    {
+        QMutexLocker locker(&m_audioMutex);
+        m_audioQueue.clear();
+    }
+#endif
     
     emit positionChanged(0);
     emit playbackStateChanged(false);
@@ -718,6 +815,11 @@ void D3D11Renderer::seek(double seconds)
     m_lastDelay = 0.033;
     m_consecutiveFastRender = 0;
     
+    // 唤醒可能在等待的线程
+    m_videoPacketCondition.wakeAll();
+    m_audioPacketCondition.wakeAll();
+    m_frameCondition.wakeAll();
+    
 #if SDL3_AVAILABLE
     // 清空 SDL 音频队列
     if (m_sdlAudioStream) {
@@ -739,64 +841,70 @@ void D3D11Renderer::setVolume(int volume)
     // SDL3: 音量在 processAudio() 中处理
 }
 
-void D3D11Renderer::decodeThread()
+// ========================================
+// Demux 线程：读取 Packet 并分发到音视频队列
+// 不做任何解码，只负责 I/O 和分发
+// ========================================
+void D3D11Renderer::demuxThread()
 {
 #if FFMPEG_AVAILABLE && defined(_WIN32)
     if (!m_formatCtx) return;
     
-    AVPacket *packet = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
+    qDebug() << "[Demux] 线程启动";
     
     while (m_running) {
-        // ========================================
-        // 【关键】解码限速：如果视频超前音频太多，等待
-        // 防止硬件解码太快导致视频 PTS 远超音频时钟
-        // ========================================
-        {
-            QMutexLocker locker(&m_frameMutex);
-            if (!m_frameQueue.isEmpty() && m_audioClockValid) {
-                double newestVideoPts = m_frameQueue.back().pts;
-                double diff = newestVideoPts - m_audioClock;
-                
-                // 如果视频超前音频超过 0.5 秒，等待
-                while (diff > 0.5 && m_running && !m_seeking) {
-                    // 释放锁，等待 20ms
-                    m_frameCondition.wait(&m_frameMutex, 20);
-                    
-                    // 重新计算差距
-                    if (m_frameQueue.isEmpty()) break;
-                    newestVideoPts = m_frameQueue.back().pts;
-                    diff = newestVideoPts - m_audioClock;
-                }
-            }
-        }
-        
         // 处理 seek
         if (m_seeking) {
             int64_t timestamp = static_cast<int64_t>(m_seekTarget * AV_TIME_BASE);
             av_seek_frame(m_formatCtx, -1, timestamp, AVSEEK_FLAG_BACKWARD);
             
-            if (m_videoCodecCtx) avcodec_flush_buffers(m_videoCodecCtx);
-            if (m_audioCodecCtx) avcodec_flush_buffers(m_audioCodecCtx);
+            // 清空 Packet 队列
+            {
+                QMutexLocker locker(&m_videoPacketMutex);
+                while (!m_videoPacketQueue.isEmpty()) {
+                    AVPacket *pkt = m_videoPacketQueue.dequeue();
+                    if (pkt) av_packet_free(&pkt);
+                }
+            }
+            {
+                QMutexLocker locker(&m_audioPacketMutex);
+                while (!m_audioPacketQueue.isEmpty()) {
+                    AVPacket *pkt = m_audioPacketQueue.dequeue();
+                    if (pkt) av_packet_free(&pkt);
+                }
+            }
             
-            {
-                QMutexLocker locker(&m_frameMutex);
-                m_frameQueue.clear();
-            }
-            {
-                QMutexLocker locker(&m_audioMutex);
-                m_audioQueue.clear();
-            }
             m_seeking = false;
+            
+            // 唤醒解码线程
+            m_videoPacketCondition.wakeAll();
+            m_audioPacketCondition.wakeAll();
         }
         
+        // 读取 Packet
+        AVPacket *packet = av_packet_alloc();
         int ret = av_read_frame(m_formatCtx, packet);
+        
         if (ret < 0) {
+            av_packet_free(&packet);
+            
             if (ret == AVERROR_EOF) {
                 if (m_loop) {
+                    // 循环播放：回到开头
                     av_seek_frame(m_formatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
-                    if (m_videoCodecCtx) avcodec_flush_buffers(m_videoCodecCtx);
-                    if (m_audioCodecCtx) avcodec_flush_buffers(m_audioCodecCtx);
+                    
+                    // 通知解码线程 flush
+                    {
+                        QMutexLocker locker(&m_videoPacketMutex);
+                        // 插入 nullptr 作为 flush 信号
+                        m_videoPacketQueue.enqueue(nullptr);
+                        m_videoPacketCondition.wakeOne();
+                    }
+                    {
+                        QMutexLocker locker(&m_audioPacketMutex);
+                        m_audioPacketQueue.enqueue(nullptr);
+                        m_audioPacketCondition.wakeOne();
+                    }
                     continue;
                 }
                 emit endOfFile();
@@ -804,187 +912,324 @@ void D3D11Renderer::decodeThread()
             break;
         }
         
-        // 视频解码
-        if (packet->stream_index == m_videoStreamIndex && m_videoCodecCtx) {
-            ret = avcodec_send_packet(m_videoCodecCtx, packet);
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(m_videoCodecCtx, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                if (ret < 0) break;
+        // 分发到对应队列
+        if (packet->stream_index == m_videoStreamIndex) {
+            QMutexLocker locker(&m_videoPacketMutex);
+            
+            // 队列满时等待（不阻塞音频！）
+            while (m_videoPacketQueue.size() >= MAX_VIDEO_PACKET_QUEUE && m_running && !m_seeking) {
+                m_videoPacketCondition.wait(&m_videoPacketMutex, 10);
+            }
+            
+            if (m_running && !m_seeking) {
+                m_videoPacketQueue.enqueue(packet);
+                m_videoPacketCondition.wakeOne();
+            } else {
+                av_packet_free(&packet);
+            }
+        }
+        else if (packet->stream_index == m_audioStreamIndex) {
+            QMutexLocker locker(&m_audioPacketMutex);
+            
+            // 队列满时等待（不阻塞视频！）
+            while (m_audioPacketQueue.size() >= MAX_AUDIO_PACKET_QUEUE && m_running && !m_seeking) {
+                m_audioPacketCondition.wait(&m_audioPacketMutex, 10);
+            }
+            
+            if (m_running && !m_seeking) {
+                m_audioPacketQueue.enqueue(packet);
+                m_audioPacketCondition.wakeOne();
+            } else {
+                av_packet_free(&packet);
+            }
+        }
+        else {
+            // 其他流（字幕等），丢弃
+            av_packet_free(&packet);
+        }
+    }
+    
+    // 通知解码线程结束
+    m_videoPacketCondition.wakeAll();
+    m_audioPacketCondition.wakeAll();
+    
+    qDebug() << "[Demux] 线程结束";
+#endif
+}
+
+// ========================================
+// 视频解码线程：独立解码，不受音频影响
+// ========================================
+void D3D11Renderer::videoDecodeThread()
+{
+#if FFMPEG_AVAILABLE && defined(_WIN32)
+    if (!m_videoCodecCtx) return;
+    
+    qDebug() << "[视频解码] 线程启动";
+    
+    AVFrame *frame = av_frame_alloc();
+    
+    while (m_running) {
+        // 从 Packet 队列取出
+        AVPacket *packet = nullptr;
+        {
+            QMutexLocker locker(&m_videoPacketMutex);
+            
+            while (m_videoPacketQueue.isEmpty() && m_running) {
+                m_videoPacketCondition.wait(&m_videoPacketMutex, 50);
+            }
+            
+            if (!m_running) break;
+            if (m_videoPacketQueue.isEmpty()) continue;
+            
+            packet = m_videoPacketQueue.dequeue();  // 取出指针，由此函数负责释放
+            
+            m_videoPacketCondition.wakeOne();  // 通知 Demux 线程
+        }
+        
+        // 空 Packet = flush 信号
+        if (!packet) {
+            avcodec_flush_buffers(m_videoCodecCtx);
+            
+            // 清空帧队列
+            {
+                QMutexLocker locker(&m_frameMutex);
+                m_frameQueue.clear();
+            }
+            
+            // 重置视频时钟
+            m_videoClockValid = false;
+            m_videoStartPts = 0;
+            continue;
+        }
+        
+        // 解码
+        int ret = avcodec_send_packet(m_videoCodecCtx, packet);
+        av_packet_free(&packet);
+        
+        while (ret >= 0 && m_running) {
+            ret = avcodec_receive_frame(m_videoCodecCtx, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) break;
+            
+            double pts = 0;
+            AVStream *stream = m_formatCtx->streams[m_videoStreamIndex];
+            if (frame->pts != AV_NOPTS_VALUE) {
+                pts = frame->pts * av_q2d(stream->time_base);
+            }
+            
+            VideoFrame vf;
+            vf.pts = pts;
+            
+            // ========================================
+            // 硬件解码路径：D3D11VA
+            // ========================================
+            if (m_hwDeviceCtx && frame->format == AV_PIX_FMT_D3D11) {
+                ID3D11Texture2D *texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
+                int textureIndex = reinterpret_cast<intptr_t>(frame->data[1]);
                 
-                double pts = 0;
-                AVStream *stream = m_formatCtx->streams[m_videoStreamIndex];
-                if (frame->pts != AV_NOPTS_VALUE) {
-                    pts = frame->pts * av_q2d(stream->time_base);
+                // 复制纹理（因为解码器会复用）
+                D3D11_TEXTURE2D_DESC desc;
+                texture->GetDesc(&desc);
+                
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                desc.MiscFlags = 0;
+                desc.ArraySize = 1;
+                
+                ComPtr<ID3D11Texture2D> copyTexture;
+                
+                {
+                    QMutexLocker d3dLock(&m_d3dMutex);
+                    if (SUCCEEDED(m_device->CreateTexture2D(&desc, nullptr, &copyTexture))) {
+                        m_context->CopySubresourceRegion(
+                            copyTexture.Get(), 0, 0, 0, 0,
+                            texture, textureIndex, nullptr
+                        );
+                    }
                 }
                 
-                VideoFrame vf;
-                vf.pts = pts;
+                if (copyTexture) {
+                    vf.texture = copyTexture;
+                    vf.textureIndex = 0;
+                }
+            }
+            // ========================================
+            // 软件解码路径：CPU → BGRA → D3D11 Texture
+            // ========================================
+            else {
+                AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
+                if (!m_swsCtx) {
+                    m_swsCtx = sws_getContext(
+                        m_videoWidth, m_videoHeight, srcFmt,
+                        m_videoWidth, m_videoHeight, AV_PIX_FMT_BGRA,
+                        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+                    );
+                    qDebug() << "软件解码: 创建颜色转换，格式:" << av_get_pix_fmt_name(srcFmt) << "→ BGRA";
+                }
                 
-                // ========================================
-                // 硬件解码路径：D3D11VA
-                // ========================================
-                if (m_hwDeviceCtx && frame->format == AV_PIX_FMT_D3D11) {
-                    ID3D11Texture2D *texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
-                    int textureIndex = reinterpret_cast<intptr_t>(frame->data[1]);
+                if (m_swsCtx) {
+                    int bgraLinesize = m_videoWidth * 4;
+                    std::vector<uint8_t> bgraBuffer(bgraLinesize * m_videoHeight);
+                    uint8_t *bgraData[1] = {bgraBuffer.data()};
+                    int bgraLinesizes[1] = {bgraLinesize};
                     
-                    // 复制纹理（因为解码器会复用）
-                    D3D11_TEXTURE2D_DESC desc;
-                    texture->GetDesc(&desc);
+                    sws_scale(m_swsCtx, frame->data, frame->linesize, 0, m_videoHeight,
+                             bgraData, bgraLinesizes);
                     
+                    D3D11_TEXTURE2D_DESC desc = {};
+                    desc.Width = m_videoWidth;
+                    desc.Height = m_videoHeight;
+                    desc.MipLevels = 1;
+                    desc.ArraySize = 1;
+                    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    desc.SampleDesc.Count = 1;
                     desc.Usage = D3D11_USAGE_DEFAULT;
                     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                    desc.MiscFlags = 0;
-                    desc.ArraySize = 1;
                     
-                    ComPtr<ID3D11Texture2D> copyTexture;
+                    D3D11_SUBRESOURCE_DATA initData = {};
+                    initData.pSysMem = bgraBuffer.data();
+                    initData.SysMemPitch = bgraLinesize;
                     
-                    // 锁定 D3D11 上下文进行纹理复制
+                    ComPtr<ID3D11Texture2D> softTexture;
                     {
                         QMutexLocker d3dLock(&m_d3dMutex);
-                        if (SUCCEEDED(m_device->CreateTexture2D(&desc, nullptr, &copyTexture))) {
-                            m_context->CopySubresourceRegion(
-                                copyTexture.Get(), 0, 0, 0, 0,
-                                texture, textureIndex, nullptr
-                            );
-                        }
+                        m_device->CreateTexture2D(&desc, &initData, &softTexture);
                     }
                     
-                    if (copyTexture) {
-                        vf.texture = copyTexture;
+                    if (softTexture) {
+                        vf.texture = softTexture;
                         vf.textureIndex = 0;
-                    }
-                }
-                // ========================================
-                // 软件解码路径：CPU → BGRA → D3D11 Texture
-                // ========================================
-                else {
-                    // 创建/更新 SwsContext（转换为 BGRA，便于上传到 D3D11）
-                    AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
-                    if (!m_swsCtx) {
-                        m_swsCtx = sws_getContext(
-                            m_videoWidth, m_videoHeight, srcFmt,
-                            m_videoWidth, m_videoHeight, AV_PIX_FMT_BGRA,
-                            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
-                        );
-                        qDebug() << "软件解码: 创建颜色转换，格式:" << av_get_pix_fmt_name(srcFmt) << "→ BGRA";
-                    }
-                    
-                    if (m_swsCtx) {
-                        // 分配 BGRA 缓冲区
-                        int bgraLinesize = m_videoWidth * 4;
-                        std::vector<uint8_t> bgraBuffer(bgraLinesize * m_videoHeight);
-                        uint8_t *bgraData[1] = {bgraBuffer.data()};
-                        int bgraLinesizes[1] = {bgraLinesize};
-                        
-                        // 转换到 BGRA
-                        sws_scale(m_swsCtx, frame->data, frame->linesize, 0, m_videoHeight,
-                                 bgraData, bgraLinesizes);
-                        
-                        // 创建 D3D11 BGRA 纹理
-                        D3D11_TEXTURE2D_DESC desc = {};
-                        desc.Width = m_videoWidth;
-                        desc.Height = m_videoHeight;
-                        desc.MipLevels = 1;
-                        desc.ArraySize = 1;
-                        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                        desc.SampleDesc.Count = 1;
-                        desc.Usage = D3D11_USAGE_DEFAULT;
-                        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                        
-                        D3D11_SUBRESOURCE_DATA initData = {};
-                        initData.pSysMem = bgraBuffer.data();
-                        initData.SysMemPitch = bgraLinesize;
-                        
-                        ComPtr<ID3D11Texture2D> softTexture;
-                        {
-                            QMutexLocker d3dLock(&m_d3dMutex);
-                            m_device->CreateTexture2D(&desc, &initData, &softTexture);
-                        }
-                        
-                        if (softTexture) {
-                            vf.texture = softTexture;
-                            vf.textureIndex = 0;
-                            vf.isBGRA = true;  // 标记为 BGRA 格式
-                        }
-                    }
-                }
-                
-                // 加入队列（有限速保护，不会长期阻塞）
-                if (vf.texture) {
-                    QMutexLocker locker(&m_frameMutex);
-                    
-                    // 等待队列有空间（最多等 50ms）
-                    int waitCount = 0;
-                    while (m_frameQueue.size() >= MAX_FRAME_QUEUE && m_running && waitCount < 5) {
-                        m_frameCondition.wait(&m_frameMutex, 10);
-                        waitCount++;
-                    }
-                    
-                    // 超时则丢弃当前帧
-                    if (m_frameQueue.size() >= MAX_FRAME_QUEUE) {
-                        // qDebug() << "[解码] 视频队列满，丢弃新帧 pts=" << pts;
-                    } else if (m_running) {
-                        m_frameQueue.enqueue(vf);
+                        vf.isBGRA = true;
                     }
                 }
             }
-        }
-        
-        // 音频解码
-        if (packet->stream_index == m_audioStreamIndex && m_audioCodecCtx && m_swrCtx) {
-            ret = avcodec_send_packet(m_audioCodecCtx, packet);
             
-            static int audioPacketCount = 0;
-            audioPacketCount++;
-            
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(m_audioCodecCtx, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                if (ret < 0) {
-                    qDebug() << "[音频解码] 错误:" << ret;
-                    break;
+            // 加入帧队列
+            if (vf.texture) {
+                QMutexLocker locker(&m_frameMutex);
+                
+                // 等待队列有空间
+                while (m_frameQueue.size() >= MAX_FRAME_QUEUE && m_running) {
+                    m_frameCondition.wait(&m_frameMutex, 10);
                 }
                 
-                double pts = 0;
-                AVStream *stream = m_formatCtx->streams[m_audioStreamIndex];
-                if (frame->pts != AV_NOPTS_VALUE) {
-                    pts = frame->pts * av_q2d(stream->time_base);
-                }
-                
-                int outSamples = static_cast<int>(av_rescale_rnd(
-                    swr_get_delay(m_swrCtx, m_audioCodecCtx->sample_rate) + frame->nb_samples,
-                    44100, m_audioCodecCtx->sample_rate, AV_ROUND_UP));
-                
-                int bufferSize = outSamples * 2 * 2;
-                QByteArray audioData(bufferSize, 0);
-                uint8_t *outBuffer = reinterpret_cast<uint8_t*>(audioData.data());
-                
-                int samples = swr_convert(m_swrCtx, &outBuffer, outSamples,
-                                         const_cast<const uint8_t**>(frame->data), frame->nb_samples);
-                
-                if (samples > 0) {
-                    audioData.resize(samples * 2 * 2);
-                    
-                    AudioData ad;
-                    ad.data = audioData;
-                    ad.pts = pts;
-                    
-                    QMutexLocker locker(&m_audioMutex);
-                    if (m_audioQueue.size() < 100) {
-                        m_audioQueue.enqueue(ad);
-                    }
-                    // 队列满时直接丢弃，不输出日志
+                if (m_running) {
+                    m_frameQueue.enqueue(vf);
                 }
             }
-            
         }
-        
-        av_packet_unref(packet);
     }
     
     av_frame_free(&frame);
-    av_packet_free(&packet);
+    qDebug() << "[视频解码] 线程结束";
+#endif
+}
+
+// ========================================
+// 音频解码线程：独立解码，不受视频影响
+// ========================================
+void D3D11Renderer::audioDecodeThread()
+{
+#if FFMPEG_AVAILABLE && defined(_WIN32)
+    if (!m_audioCodecCtx || !m_swrCtx) return;
+    
+    qDebug() << "[音频解码] 线程启动";
+    
+    AVFrame *frame = av_frame_alloc();
+    
+    while (m_running) {
+        // 从 Packet 队列取出
+        AVPacket *packet = nullptr;
+        {
+            QMutexLocker locker(&m_audioPacketMutex);
+            
+            while (m_audioPacketQueue.isEmpty() && m_running) {
+                m_audioPacketCondition.wait(&m_audioPacketMutex, 50);
+            }
+            
+            if (!m_running) break;
+            if (m_audioPacketQueue.isEmpty()) continue;
+            
+            packet = m_audioPacketQueue.dequeue();  // 取出指针，由此函数负责释放
+            
+            m_audioPacketCondition.wakeOne();
+        }
+        
+        // 空 Packet = flush 信号
+        if (!packet) {
+            avcodec_flush_buffers(m_audioCodecCtx);
+            
+            // 清空音频队列
+            {
+                QMutexLocker locker(&m_audioMutex);
+                m_audioQueue.clear();
+            }
+            
+            // 重置音频时钟
+            m_audioClockValid = false;
+            m_audioStartPts = 0;
+            m_audioClock = 0;
+            m_audioWrittenBytes = 0;
+            continue;
+        }
+        
+        // 解码
+        int ret = avcodec_send_packet(m_audioCodecCtx, packet);
+        av_packet_free(&packet);
+        
+        while (ret >= 0 && m_running) {
+            ret = avcodec_receive_frame(m_audioCodecCtx, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) {
+                qDebug() << "[音频解码] 错误:" << ret;
+                break;
+            }
+            
+            double pts = 0;
+            AVStream *stream = m_formatCtx->streams[m_audioStreamIndex];
+            if (frame->pts != AV_NOPTS_VALUE) {
+                pts = frame->pts * av_q2d(stream->time_base);
+            }
+            
+            int outSamples = static_cast<int>(av_rescale_rnd(
+                swr_get_delay(m_swrCtx, m_audioCodecCtx->sample_rate) + frame->nb_samples,
+                44100, m_audioCodecCtx->sample_rate, AV_ROUND_UP));
+            
+            int bufferSize = outSamples * 2 * 2;
+            QByteArray audioData(bufferSize, 0);
+            uint8_t *outBuffer = reinterpret_cast<uint8_t*>(audioData.data());
+            
+            int samples = swr_convert(m_swrCtx, &outBuffer, outSamples,
+                                     const_cast<const uint8_t**>(frame->data), frame->nb_samples);
+            
+            if (samples > 0) {
+                audioData.resize(samples * 2 * 2);
+                
+                AudioData ad;
+                ad.data = audioData;
+                ad.pts = pts;
+                ad.volumeAdjusted = false;
+                
+                QMutexLocker locker(&m_audioMutex);
+                
+                // 等待队列有空间
+                while (m_audioQueue.size() >= 100 && m_running) {
+                    // 音频队列满时，短暂等待
+                    locker.unlock();
+                    QThread::msleep(5);
+                    locker.relock();
+                }
+                
+                if (m_running) {
+                    m_audioQueue.enqueue(ad);
+                }
+            }
+        }
+    }
+    
+    av_frame_free(&frame);
+    qDebug() << "[音频解码] 线程结束";
 #endif
 }
 
@@ -1363,14 +1608,15 @@ void D3D11Renderer::processAudio()
                 }
             }
             
-            // 音量调整
-            if (m_volume < 100) {
+            // 音量调整（只处理一次，避免重复缩放失真）
+            if (m_volume < 100 && !ad.volumeAdjusted) {
                 int16_t *samples = reinterpret_cast<int16_t*>(ad.data.data());
                 int count = ad.data.size() / 2;
                 float volumeScale = m_volume / 100.0f;
                 for (int i = 0; i < count; i++) {
                     samples[i] = static_cast<int16_t>(samples[i] * volumeScale);
                 }
+                ad.volumeAdjusted = true;
             }
             
             // 写入 SDL 音频流
@@ -1429,7 +1675,7 @@ void D3D11Renderer::processAudio()
     
     while (!m_audioQueue.isEmpty()) {
         qint64 bytesFree = m_audioSink->bytesFree();
-        if (bytesFree < 2048) break;
+        if (bytesFree < 1024) break; // 避免反复调用 write 占满事件循环
         
         AudioData &ad = m_audioQueue.head();
         
@@ -1438,20 +1684,42 @@ void D3D11Renderer::processAudio()
             m_audioClockValid = true;
         }
         
-        if (m_volume < 100) {
+        // 仅在第一次写入前调整音量，避免重复缩放
+        if (m_volume < 100 && !ad.volumeAdjusted) {
             int16_t *samples = reinterpret_cast<int16_t*>(ad.data.data());
             int count = ad.data.size() / 2;
             float volumeScale = m_volume / 100.0f;
             for (int i = 0; i < count; i++) {
                 samples[i] = static_cast<int16_t>(samples[i] * volumeScale);
             }
+            ad.volumeAdjusted = true;
         }
         
-        qint64 written = m_audioDevice->write(ad.data);
-        if (written > 0) {
+        // 处理可能的部分写入，避免截断导致失真
+        qint64 offset = 0;
+        qint64 remaining = ad.data.size();
+        while (remaining > 0) {
+            bytesFree = m_audioSink->bytesFree();
+            if (bytesFree <= 0) break;
+            
+            const qint64 toWrite = qMin<qint64>(bytesFree, remaining);
+            qint64 written = m_audioDevice->write(ad.data.constData() + offset, toWrite);
+            if (written <= 0) {
+                // 写入失败或设备暂不可写，稍后重试
+                break;
+            }
+            
+            offset += written;
+            remaining -= written;
             m_audioWrittenBytes += written;
+        }
+        
+        if (remaining == 0) {
+            // 完整写入，弹出队列
             m_audioQueue.dequeue();
         } else {
+            // 仅写入部分，保留未写入的数据
+            ad.data = ad.data.mid(offset);
             break;
         }
     }

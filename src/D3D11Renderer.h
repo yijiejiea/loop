@@ -45,7 +45,9 @@ extern "C" {
 struct AudioData {
     QByteArray data;
     double pts = 0;
+    bool volumeAdjusted = false; // 避免重复缩放导致失真
 };
+
 
 /**
  * @brief D3D11 视频播放器 (Windows 平台)
@@ -114,8 +116,12 @@ private:
     // FFmpeg 初始化
     bool initHardwareDecoder(const AVCodec *codec);
     
-    // 解码和渲染
-    void decodeThread();
+    // 三线程架构
+    void demuxThread();       // Demux 线程：读取 packet 并分发到音视频队列
+    void videoDecodeThread(); // 视频解码线程：从 packet 队列解码到帧队列
+    void audioDecodeThread(); // 音频解码线程：从 packet 队列解码到音频队列
+    
+    // 渲染
     void renderFrame(ID3D11Texture2D *texture, int textureIndex);
     void renderNV12Frame(ID3D11Texture2D *texture, int textureIndex);
     void renderBGRAFrame(ID3D11Texture2D *texture);
@@ -155,13 +161,31 @@ private:
     int m_audioStreamIndex = -1;
 #endif
 
-    // 解码线程
-    std::unique_ptr<QThread> m_decodeThread;
+    // ========================================
+    // 三线程架构：Demux + 视频解码 + 音频解码
+    // ========================================
+    std::unique_ptr<QThread> m_demuxThread;      // Demux 线程：读取 packet 并分发
+    std::unique_ptr<QThread> m_videoDecodeThread; // 视频解码线程：独立解码
+    std::unique_ptr<QThread> m_audioDecodeThread; // 音频解码线程：独立解码
+    
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_seeking{false};
     double m_seekTarget = 0;
     
-    // 音频队列
+#if FFMPEG_AVAILABLE
+    // Packet 队列（Demux → Decode）
+    // 存储 AVPacket* 指针，取出后由消费者负责释放
+    QQueue<AVPacket*> m_videoPacketQueue;  // 视频 Packet 队列
+    QQueue<AVPacket*> m_audioPacketQueue;  // 音频 Packet 队列
+#endif
+    QMutex m_videoPacketMutex;
+    QMutex m_audioPacketMutex;
+    QWaitCondition m_videoPacketCondition;  // 视频 Packet 队列非空
+    QWaitCondition m_audioPacketCondition;  // 音频 Packet 队列非空
+    static constexpr int MAX_VIDEO_PACKET_QUEUE = 60;  // 视频 Packet 队列最大值
+    static constexpr int MAX_AUDIO_PACKET_QUEUE = 120; // 音频 Packet 队列最大值
+    
+    // 音频帧队列（解码后）
     QQueue<AudioData> m_audioQueue;
     QMutex m_audioMutex;
     
